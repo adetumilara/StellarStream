@@ -538,7 +538,6 @@ export default function StreamDetailPage() {
           )}
         </div>
       </Card>
-      <div></div>
     </div>
   );
 }
