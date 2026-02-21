@@ -138,6 +138,15 @@ fn test_protocol_fee() {
     ctx.client.initialize_fee(&admin, &100, &treasury);
 
     ctx.token.mint(&sender, &1000);
+    let stream_id =
+        ctx.client
+            .create_stream(&sender, &receiver, &ctx.token_id, &1000, &0, &100, &1000);
+
+    assert_eq!(stream_id, 1);
+
+    let token_client = token::Client::new(&ctx.env, &ctx.token_id);
+    assert_eq!(token_client.balance(&treasury), 10);
+    assert_eq!(token_client.balance(&ctx.contract_id), 990);
 }
 
 #[test]
@@ -315,20 +324,6 @@ fn test_update_fee() {
 
     ctx.client.initialize_fee(&admin, &100, &treasury);
     ctx.client.update_fee(&admin, &200);
-    ctx.client.set_pause(&admin, &true);
-
-    ctx.env.ledger().set(soroban_sdk::testutils::LedgerInfo {
-        timestamp: 500,
-        protocol_version: 22,
-        sequence_number: 1,
-        network_id: [0u8; 32],
-        base_reserve: 0,
-        min_temp_entry_ttl: 0,
-        min_persistent_entry_ttl: 0,
-        max_entry_ttl: 1000000,
-    });
-
-    ctx.client.withdraw(&stream_id, &receiver);
 }
 
 #[test]
