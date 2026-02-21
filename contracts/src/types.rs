@@ -15,6 +15,16 @@ pub struct Stream {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StreamRequest {
+    pub receiver: Address,
+    pub amount: i128,
+    pub start_time: u64,
+    pub cliff_time: u64,
+    pub end_time: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
     Stream(u64),
     StreamId,

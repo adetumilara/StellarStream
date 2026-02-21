@@ -143,6 +143,53 @@ fn test_transfer_receiver() {
 
 }
 
+fn test_batch_stream_creation() {
+    let ctx = setup_test();
+    let sender = Address::generate(&ctx.env);
+    let receiver1 = Address::generate(&ctx.env);
+    let receiver2 = Address::generate(&ctx.env);
+    let receiver3 = Address::generate(&ctx.env);
+
+    let total_amount = 3000_i128;
+    ctx.token.mint(&sender, &total_amount);
+
+    let mut requests = soroban_sdk::Vec::new(&ctx.env);
+    requests.push_back(StreamRequest {
+        receiver: receiver1.clone(),
+        amount: 1000,
+        start_time: 0,
+        cliff_time: 100,
+        end_time: 1000,
+    });
+    requests.push_back(StreamRequest {
+        receiver: receiver2.clone(),
+        amount: 1500,
+        start_time: 0,
+        cliff_time: 100,
+        end_time: 1000,
+    });
+    requests.push_back(StreamRequest {
+        receiver: receiver3.clone(),
+        amount: 500,
+        start_time: 0,
+        cliff_time: 100,
+        end_time: 1000,
+    });
+
+    let stream_ids = ctx
+        .client
+        .create_batch_streams(&sender, &ctx.token_id, &requests);
+
+    assert_eq!(stream_ids.len(), 3);
+    assert_eq!(stream_ids.get(0).unwrap(), 1);
+    assert_eq!(stream_ids.get(1).unwrap(), 2);
+    assert_eq!(stream_ids.get(2).unwrap(), 3);
+
+    let token_client = token::Client::new(&ctx.env, &ctx.token_id);
+    assert_eq!(token_client.balance(&ctx.contract_id), 3000);
+}
+
+#[test]
 #[should_panic(expected = "Contract is paused")]
 fn test_pause_blocks_create_stream() {
     let ctx = setup_test();
@@ -155,7 +202,7 @@ fn test_pause_blocks_create_stream() {
 
     ctx.token.mint(&sender, &1000);
     ctx.client
-        .create_stream(&sender, &receiver, &ctx.token_id, &1000, &0, &1000);
+        .create_stream(&sender, &receiver, &ctx.token_id, &1000, &0, &100, &1000);
 }
 
 #[test]
@@ -168,9 +215,9 @@ fn test_pause_blocks_withdraw() {
 
     ctx.client.initialize(&admin);
     ctx.token.mint(&sender, &1000);
-    let stream_id = ctx
-        .client
-        .create_stream(&sender, &receiver, &ctx.token_id, &1000, &0, &1000);
+    let stream_id =
+        ctx.client
+            .create_stream(&sender, &receiver, &ctx.token_id, &1000, &0, &100, &1000);
 
     ctx.client.set_pause(&admin, &true);
 
@@ -269,9 +316,20 @@ fn test_unpause_allows_operations() {
     ctx.client.set_pause(&admin, &false);
 
     ctx.token.mint(&sender, &1000);
-    let stream_id = ctx
-        .client
-        .create_stream(&sender, &receiver, &ctx.token_id, &1000, &0, &1000);
+    let stream_id =
+        ctx.client
+            .create_stream(&sender, &receiver, &ctx.token_id, &1000, &0, &100, &1000);
+
+    ctx.env.ledger().set(soroban_sdk::testutils::LedgerInfo {
+        timestamp: 500,
+        protocol_version: 22,
+        sequence_number: 1,
+        network_id: [0u8; 32],
+        base_reserve: 0,
+        min_temp_entry_ttl: 0,
+        min_persistent_entry_ttl: 0,
+        max_entry_ttl: 1000000,
+    });
 
     assert_eq!(stream_id, 1);
     let withdrawn = ctx.client.withdraw(&stream_id, &receiver);
