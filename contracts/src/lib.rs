@@ -4,8 +4,8 @@ pub mod math;
 mod test;
 mod types;
 
-use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env};
-pub use types::{DataKey, Stream};
+use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env, Vec};
+pub use types::{DataKey, Stream, StreamRequest};
 
 const THRESHOLD: u32 = 518400; // ~30 days
 const LIMIT: u32 = 1036800; // ~60 days
@@ -102,6 +102,65 @@ impl StellarStream {
             .publish((symbol_short!("create"), sender), stream_id);
 
         stream_id
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_batch_streams(
+        env: Env,
+        sender: Address,
+        token: Address,
+        requests: Vec<StreamRequest>,
+    ) -> Vec<u64> {
+        sender.require_auth();
+
+        let mut total_amount: i128 = 0;
+        for request in requests.iter() {
+            if request.end_time <= request.start_time {
+                panic!("End time must be after start time");
+            }
+            if request.amount <= 0 {
+                panic!("Amount must be greater than zero");
+            }
+            total_amount += request.amount;
+        }
+
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&sender, &env.current_contract_address(), &total_amount);
+
+        let mut stream_ids = Vec::new(&env);
+        let mut stream_id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::StreamId)
+            .unwrap_or(0);
+
+        for request in requests.iter() {
+            stream_id += 1;
+
+            let stream = Stream {
+                sender: sender.clone(),
+                receiver: request.receiver.clone(),
+                token: token.clone(),
+                amount: request.amount,
+                start_time: request.start_time,
+                cliff_time: request.cliff_time,
+                end_time: request.end_time,
+                withdrawn_amount: 0,
+            };
+
+            env.storage()
+                .persistent()
+                .set(&DataKey::Stream(stream_id), &stream);
+
+            env.events()
+                .publish((symbol_short!("create"), sender.clone()), stream_id);
+
+            stream_ids.push_back(stream_id);
+        }
+
+        env.storage().instance().set(&DataKey::StreamId, &stream_id);
+
+        stream_ids
     }
 
     pub fn withdraw(env: Env, stream_id: u64, receiver: Address) -> i128 {
