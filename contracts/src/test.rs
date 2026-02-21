@@ -142,6 +142,7 @@ fn test_transfer_receiver() {
     ctx.client.transfer_receiver(&stream_id, &new_receiver);
 }
 
+#[test]
 fn test_batch_stream_creation() {
     let ctx = setup_test();
     let sender = Address::generate(&ctx.env);
