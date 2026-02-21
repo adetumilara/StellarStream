@@ -303,9 +303,7 @@ fn test_cliff_blocks_withdrawal() {
     ctx.token.mint(&sender, &1000);
     let stream_id =
         ctx.client
-            .create_stream(&sender, &old_receiver, &ctx.token_id, &1000, &0, &1000);
-
-    ctx.client.transfer_receiver(&stream_id, &new_receiver);
+            .create_stream(&sender, &receiver, &ctx.token_id, &1000, &0, &500, &1000);
 
     ctx.env.ledger().set(soroban_sdk::testutils::LedgerInfo {
         timestamp: 250,
@@ -343,7 +341,6 @@ fn test_cliff_unlocks_at_cliff_time() {
         max_entry_ttl: 1000000,
     });
 
-    ctx.client.withdraw(&stream_id, &old_receiver);
     ctx.client.withdraw(&stream_id, &receiver);
 }
 
