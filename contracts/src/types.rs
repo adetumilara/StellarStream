@@ -15,11 +15,21 @@ pub const INTEREST_SPLIT_SENDER_RECEIVER: u32 = 0b011; // 3: 50/50 sender/receiv
 #[allow(dead_code)]
 pub const INTEREST_SPLIT_ALL: u32 = 0b111; // 7: 33/33/33 split
 
+// Curve types for vesting schedules
 #[contracttype]
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CurveType {
     Linear = 0,
     Exponential = 1,
+}
+
+// Role definitions for RBAC
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Role {
+    Admin,           // Can grant/revoke roles, upgrade contract
+    Pauser,          // Can pause/unpause contract
+    TreasuryManager, // Can update fees and treasury address
 }
 
 #[contracttype]
@@ -119,13 +129,14 @@ pub struct InterestDistribution {
 pub enum DataKey {
     Stream(u64),
     StreamId,
-    Admin,
+    Admin, // Kept for backward compatibility
     FeeBps,
     Treasury,
     IsPaused,
     ReentrancyLock,
     ContractVersion,        // Tracks current contract version
     MigrationExecuted(u32), // Tracks which migrations have been executed
+    Role(Address, Role),    // RBAC: stores role assignments
 }
 
 #[contracttype]
