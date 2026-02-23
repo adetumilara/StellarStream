@@ -12,10 +12,10 @@ use errors::Error;
 use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env, Vec};
 use storage::{PROPOSAL_COUNT, RECEIPT, STREAM_COUNT, RESTRICTED_ADDRESSES};
 use types::{
-    AddressRestrictedEvent, CurveType, DataKey, Milestone, ProposalApprovedEvent,
-    ProposalCreatedEvent, ReceiptMetadata, ReceiptTransferredEvent, Role, Stream,
-    StreamCancelledEvent, StreamClaimEvent, StreamCreatedEvent, StreamPausedEvent, StreamProposal,
-    StreamReceipt, StreamUnpausedEvent,
+    ContributorRequest, RequestCreatedEvent, RequestExecutedEvent, RequestKey, RequestStatus,
+    CurveType, DataKey, Milestone, ProposalApprovedEvent, ProposalCreatedEvent, ReceiptMetadata,
+    ReceiptTransferredEvent, Role, Stream, StreamCancelledEvent, StreamClaimEvent,
+    StreamCreatedEvent, StreamPausedEvent, StreamProposal, StreamReceipt, StreamUnpausedEvent,
 };
 
 #[contract]
@@ -834,7 +834,7 @@ impl StellarStreamContract {
 
         // Check if caller has Admin role
         if !Self::has_role(&env, &admin, Role::Admin) {
-            panic!("Unauthorized: Only Admin can grant roles");
+            panic!("{}", Error::Unauthorized as u32);
         }
 
         // Grant the role
@@ -852,7 +852,7 @@ impl StellarStreamContract {
 
         // Check if caller has Admin role
         if !Self::has_role(&env, &admin, Role::Admin) {
-            panic!("Unauthorized: Only Admin can revoke roles");
+            return; // Error::Unauthorized;
         }
 
         // Revoke the role
@@ -887,7 +887,7 @@ impl StellarStreamContract {
 
         // Check if caller has Admin role
         if !Self::has_role(&env, &admin, Role::Admin) {
-            panic!("Unauthorized: Only Admin can upgrade contract");
+            return; // Error::Unauthorized;
         }
 
         // Update the contract WASM
@@ -907,136 +907,85 @@ impl StellarStreamContract {
             .expect("Admin not set")
     }
 
-    // ========== OFAC Compliance Functions ==========
+    // --- CONTRIBUTOR PULL-REQUEST PAYMENTS ---
 
-    /// Add an address to the restricted list (Admin only)
-    /// Prevents the restricted address from being a receiver in streams
-    pub fn restrict_address(env: Env, admin: Address, target: Address) -> Result<(), Error> {
+    pub fn create_request(
+        env: Env,
+        receiver: Address,
+        token: Address,
+        total_amount: i128,
+        duration: u64,
+        metadata: Option<soroban_sdk::BytesN<32>>,
+    ) -> u64 {
+        receiver.require_auth();
+        let count: u64 = env.storage().instance().get(&RequestKey::RequestCount).unwrap_or(0);
+        let request_id = count + 1;
+        let now = env.ledger().timestamp();
+        let request = ContributorRequest {
+            id: request_id,
+            receiver: receiver.clone(),
+            token: token.clone(),
+            total_amount,
+            duration,
+            start_time: now,
+            status: RequestStatus::Pending,
+            metadata,
+        };
+        env.storage().instance().set(&RequestKey::Request(request_id), &request);
+        env.storage().instance().set(&RequestKey::RequestCount, &request_id);
+        env.events().publish(
+            (soroban_sdk::Symbol::new(&env, "RequestCreated"), request_id),
+            RequestCreatedEvent {
+                request_id,
+                receiver,
+                token,
+                total_amount,
+                duration,
+                timestamp: now,
+            },
+        );
+        request_id
+    }
+
+    pub fn execute_request(env: Env, admin: Address, request_id: u64) -> Result<u64, Error> {
         admin.require_auth();
-
-        // Check if caller has Admin role
         if !Self::has_role(&env, &admin, Role::Admin) {
             return Err(Error::Unauthorized);
         }
-
-        // Get current restricted list
-        let mut restricted: Vec<Address> = env
+        let mut request: ContributorRequest = env
             .storage()
             .instance()
-            .get(&RESTRICTED_ADDRESSES)
-            .unwrap_or_else(|| Vec::new(&env));
-
-        // Check if already restricted
-        for addr in restricted.iter() {
-            if addr == target {
-                return Ok(()); // Already restricted, no-op
-            }
+            .get(&RequestKey::Request(request_id))
+            .ok_or(Error::StreamNotFound)?;
+        if request.status != RequestStatus::Pending {
+            return Err(Error::AlreadyExecuted);
         }
-
-        // Add to restricted list
-        restricted.push_back(target.clone());
-        env.storage()
-            .instance()
-            .set(&RESTRICTED_ADDRESSES, &restricted);
-
-        // Emit event
+        request.status = RequestStatus::Approved;
+        env.storage().instance().set(&RequestKey::Request(request_id), &request);
+        let stream_id = Self::create_stream(
+            env.clone(),
+            admin.clone(),
+            request.receiver.clone(),
+            request.token.clone(),
+            request.total_amount,
+            request.start_time,
+            request.start_time + request.duration,
+            CurveType::Linear,
+        )?;
         env.events().publish(
-            (symbol_short!("restrict"), target.clone()),
-            AddressRestrictedEvent {
-                address: target,
-                restricted: true,
+            (soroban_sdk::Symbol::new(&env, "RequestExecuted"), request_id),
+            RequestExecutedEvent {
+                request_id,
+                stream_id,
+                executor: admin,
                 timestamp: env.ledger().timestamp(),
             },
         );
-
-        Ok(())
+        Ok(stream_id)
     }
 
-    /// Remove an address from the restricted list (Admin only)
-    pub fn unrestrict_address(env: Env, admin: Address, target: Address) -> Result<(), Error> {
-        admin.require_auth();
-
-        // Check if caller has Admin role
-        if !Self::has_role(&env, &admin, Role::Admin) {
-            return Err(Error::Unauthorized);
-        }
-
-        // Get current restricted list
-        let restricted: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&RESTRICTED_ADDRESSES)
-            .unwrap_or_else(|| Vec::new(&env));
-
-        // Find and remove the address
-        let mut found = false;
-        let mut new_restricted = Vec::new(&env);
-
-        for addr in restricted.iter() {
-            if addr != target {
-                new_restricted.push_back(addr);
-            } else {
-                found = true;
-            }
-        }
-
-        if found {
-            env.storage()
-                .instance()
-                .set(&RESTRICTED_ADDRESSES, &new_restricted);
-
-            // Emit event
-            env.events().publish(
-                (symbol_short!("unrestric"), target.clone()),
-                AddressRestrictedEvent {
-                    address: target,
-                    restricted: false,
-                    timestamp: env.ledger().timestamp(),
-                },
-            );
-        }
-
-        Ok(())
-    }
-
-    /// Check if an address is restricted
-    pub fn is_address_restricted(env: Env, address: Address) -> bool {
-        let restricted: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&RESTRICTED_ADDRESSES)
-            .unwrap_or_else(|| Vec::new(&env));
-
-        for addr in restricted.iter() {
-            if addr == address {
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Get all restricted addresses
-    pub fn get_restricted_addresses(env: Env) -> Vec<Address> {
-        env.storage()
-            .instance()
-            .get(&RESTRICTED_ADDRESSES)
-            .unwrap_or_else(|| Vec::new(&env))
-    }
-
-    /// Internal helper to validate receiver is not restricted
-    fn validate_receiver(env: &Env, receiver: &Address) -> Result<(), Error> {
-        let restricted: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&RESTRICTED_ADDRESSES)
-            .unwrap_or_else(|| Vec::new(env));
-
-        for addr in restricted.iter() {
-            if &addr == receiver {
-                return Err(Error::RestrictedAddress);
-            }
-        }
-        Ok(())
+    pub fn get_request(env: Env, request_id: u64) -> Option<ContributorRequest> {
+        env.storage().instance().get(&RequestKey::Request(request_id))
     }
 }
 

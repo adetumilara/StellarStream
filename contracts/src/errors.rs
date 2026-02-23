@@ -22,5 +22,5 @@ pub enum Error {
     PriceOutOfBounds = 17,
     FlashLoanNotRepaid = 18,
     FlashLoanInProgress = 19,
-    RestrictedAddress = 20,
+    AlreadyExecuted = 20,
 }
