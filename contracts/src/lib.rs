@@ -2178,299 +2178,299 @@ mod test {
     mod ofac_tests {
         use super::*;
 
-    #[test]
-    fn test_restrict_address_by_admin() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let contract_id = env.register(StellarStreamContract, ());
-        let client = StellarStreamContractClient::new(&env, &contract_id);
-
-        let admin = Address::generate(&env);
-        let restricted_addr = Address::generate(&env);
-
-        set_admin_role(&env, &contract_id, &admin);
-
-        // Admin restricts an address
-        client.restrict_address(&admin, &restricted_addr);
-
-        // Verify address is restricted
-        assert!(client.is_address_restricted(&restricted_addr));
-    }
-
-    #[test]
-    #[ignore] // OFAC functions not implemented
-    fn test_unrestrict_address_by_admin() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let contract_id = env.register(StellarStreamContract, ());
-        let client = StellarStreamContractClient::new(&env, &contract_id);
-
-        let admin = Address::generate(&env);
-        let restricted_addr = Address::generate(&env);
-
-        // Manually set admin role in storage to bootstrap
-        env.as_contract(&contract_id, || {
-            env.storage()
-                .instance()
-                .set(&DataKey::Role(admin.clone(), Role::Admin), &true);
-        });
-
-        // Admin restricts an address
-        client.restrict_address(&admin, &restricted_addr);
-        assert!(client.is_address_restricted(&restricted_addr));
-
-        // Admin unrestricts the address
-        client.unrestrict_address(&admin, &restricted_addr);
-
-        // Verify address is no longer restricted
-        assert!(!client.is_address_restricted(&restricted_addr));
-    }
-
-    #[test]
-    #[should_panic(expected = "Error(Contract, #5)")]
-    #[ignore] // OFAC functions not implemented
-    fn test_non_admin_cannot_restrict_address() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let contract_id = env.register(StellarStreamContract, ());
-        let client = StellarStreamContractClient::new(&env, &contract_id);
-
-        let non_admin = Address::generate(&env);
-        let restricted_addr = Address::generate(&env);
-
-        // Non-admin tries to restrict an address - should panic
-        client.restrict_address(&non_admin, &restricted_addr);
-    }
-
-    #[test]
-    #[should_panic(expected = "Error(Contract, #20)")]
-    #[ignore] // OFAC functions not implemented
-    fn test_cannot_create_stream_to_restricted_address() {
-        let env = Env::default();
-        env.mock_all_auths();
-        env.ledger().with_mut(|li| li.timestamp = 100);
-
-        let contract_id = env.register(StellarStreamContract, ());
-        let client = StellarStreamContractClient::new(&env, &contract_id);
-
-        let admin = Address::generate(&env);
-        let sender = Address::generate(&env);
-        let restricted_receiver = Address::generate(&env);
-        let token_admin = Address::generate(&env);
-
-        set_admin_role(&env, &contract_id, &admin);
-
-        // Create token
-        let token_id = env.register_stellar_asset_contract(token_admin.clone());
-
-        // Mint tokens to sender
-        let token_client = token::StellarAssetClient::new(&env, &token_id);
-        token_client.mint(&sender, &1000);
-
-        // Admin restricts the receiver address
-        client.restrict_address(&admin, &restricted_receiver);
-
-        // Attempt to create stream to restricted address should panic
-        client.create_stream(
-            &sender,
-            &restricted_receiver,
-            &token_id,
-            &1000,
-            &100,
-            &200,
-            &CurveType::Linear,
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "Error(Contract, #20)")]
-    #[ignore] // OFAC functions not implemented
-    fn test_cannot_create_proposal_to_restricted_address() {
-        let env = Env::default();
-        env.mock_all_auths();
-        env.ledger().with_mut(|li| li.timestamp = 50);
-
-        let contract_id = env.register(StellarStreamContract, ());
-        let client = StellarStreamContractClient::new(&env, &contract_id);
-
-        let admin = Address::generate(&env);
-        let sender = Address::generate(&env);
-        let restricted_receiver = Address::generate(&env);
-        let token_admin = Address::generate(&env);
-
-        set_admin_role(&env, &contract_id, &admin);
-
-        // Create token
-        let token_id = env.register_stellar_asset_contract(token_admin.clone());
-
-        // Mint tokens to sender
-        let token_client = token::StellarAssetClient::new(&env, &token_id);
-        token_client.mint(&sender, &1000);
-
-        // Admin restricts the receiver address
-        client.restrict_address(&admin, &restricted_receiver);
-
-        // Attempt to create proposal to restricted address should panic
-        client.create_proposal(
-            &sender,
-            &restricted_receiver,
-            &token_id,
-            &1000,
-            &100,
-            &200,
-            &2,
-            &1000,
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "Error(Contract, #20)")]
-    #[ignore] // OFAC functions not implemented
-    fn test_cannot_transfer_receipt_to_restricted_address() {
-        let env = Env::default();
-        env.mock_all_auths();
-        env.ledger().with_mut(|li| li.timestamp = 100);
-
-        let contract_id = env.register(StellarStreamContract, ());
-        let client = StellarStreamContractClient::new(&env, &contract_id);
-
-        let admin = Address::generate(&env);
-        let sender = Address::generate(&env);
-        let receiver = Address::generate(&env);
-        let restricted_addr = Address::generate(&env);
-        let token_admin = Address::generate(&env);
-
-        set_admin_role(&env, &contract_id, &admin);
-
-        // Create token
-        let token_id = env.register_stellar_asset_contract(token_admin.clone());
-
-        // Mint tokens to sender
-        let token_client = token::StellarAssetClient::new(&env, &token_id);
-        token_client.mint(&sender, &1000);
-
-        // Create stream to valid receiver
-        let stream_id = client.create_stream(
-            &sender,
-            &receiver,
-            &token_id,
-            &1000,
-            &100,
-            &200,
-            &CurveType::Linear,
-        );
-
-        // Admin restricts an address
-        client.restrict_address(&admin, &restricted_addr);
-
-        // Attempt to transfer receipt to restricted address should panic
-        client.transfer_receipt(&stream_id, &receiver, &restricted_addr);
-    }
-
-    #[test]
-    #[ignore] // OFAC functions not implemented
-    fn test_get_restricted_addresses_list() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let contract_id = env.register(StellarStreamContract, ());
-        let client = StellarStreamContractClient::new(&env, &contract_id);
-
-        let admin = Address::generate(&env);
-        let addr1 = Address::generate(&env);
-        let addr2 = Address::generate(&env);
-        let addr3 = Address::generate(&env);
-
-        set_admin_role(&env, &contract_id, &admin);
-
-        // Initially, no restricted addresses
-        let restricted = client.get_restricted_addresses();
-        assert_eq!(restricted.len(), 0);
-
-        // Admin restricts addresses
-        client.restrict_address(&admin, &addr1);
-        client.restrict_address(&admin, &addr2);
-        client.restrict_address(&admin, &addr3);
-
-        // Verify all addresses are in the list
-        let restricted = client.get_restricted_addresses();
-        assert_eq!(restricted.len(), 3);
-    }
-
-    #[test]
-    #[ignore] // OFAC functions not implemented
-    fn test_restrict_same_address_twice_is_idempotent() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let contract_id = env.register(StellarStreamContract, ());
-        let client = StellarStreamContractClient::new(&env, &contract_id);
-
-        let admin = Address::generate(&env);
-        let restricted_addr = Address::generate(&env);
-
-        set_admin_role(&env, &contract_id, &admin);
-
-        // Restrict address first time
-        client.restrict_address(&admin, &restricted_addr);
-        let restricted_1 = client.get_restricted_addresses();
-        assert_eq!(restricted_1.len(), 1);
-
-        // Restrict same address again (should be idempotent)
-        client.restrict_address(&admin, &restricted_addr);
-        let restricted_2 = client.get_restricted_addresses();
-        assert_eq!(restricted_2.len(), 1);
-
-        // Verify address is still restricted
-        assert!(client.is_address_restricted(&restricted_addr));
-    }
-
-    #[test]
-    #[ignore] // OFAC functions not implemented
-    fn test_stream_creation_allowed_after_unrestriction() {
-        let env = Env::default();
-        env.mock_all_auths();
-        env.ledger().with_mut(|li| li.timestamp = 100);
-
-        let contract_id = env.register(StellarStreamContract, ());
-        let client = StellarStreamContractClient::new(&env, &contract_id);
-
-        let admin = Address::generate(&env);
-        let sender = Address::generate(&env);
-        let receiver = Address::generate(&env);
-        let token_admin = Address::generate(&env);
-
-        set_admin_role(&env, &contract_id, &admin);
-
-        // Create token
-        let token_id = env.register_stellar_asset_contract(token_admin.clone());
-
-        // Mint tokens to sender
-        let token_client = token::StellarAssetClient::new(&env, &token_id);
-        token_client.mint(&sender, &1000);
-
-        // Admin restricts the receiver
-        client.restrict_address(&admin, &receiver);
-
-        // Admin unrestricts the receiver
-        client.unrestrict_address(&admin, &receiver);
-
-        // Now stream creation should succeed
-        let stream_id = client.create_stream(
-            &sender,
-            &receiver,
-            &token_id,
-            &1000,
-            &100,
-            &200,
-            &CurveType::Linear,
-        );
-
-        // Verify stream was created (stream_id >= 0)
-        assert!(stream_id >= 0);
-    }
+        #[test]
+        fn test_restrict_address_by_admin() {
+            let env = Env::default();
+            env.mock_all_auths();
+
+            let contract_id = env.register(StellarStreamContract, ());
+            let client = StellarStreamContractClient::new(&env, &contract_id);
+
+            let admin = Address::generate(&env);
+            let restricted_addr = Address::generate(&env);
+
+            set_admin_role(&env, &contract_id, &admin);
+
+            // Admin restricts an address
+            client.restrict_address(&admin, &restricted_addr);
+
+            // Verify address is restricted
+            assert!(client.is_address_restricted(&restricted_addr));
+        }
+
+        #[test]
+        #[ignore] // OFAC functions not implemented
+        fn test_unrestrict_address_by_admin() {
+            let env = Env::default();
+            env.mock_all_auths();
+
+            let contract_id = env.register(StellarStreamContract, ());
+            let client = StellarStreamContractClient::new(&env, &contract_id);
+
+            let admin = Address::generate(&env);
+            let restricted_addr = Address::generate(&env);
+
+            // Manually set admin role in storage to bootstrap
+            env.as_contract(&contract_id, || {
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Role(admin.clone(), Role::Admin), &true);
+            });
+
+            // Admin restricts an address
+            client.restrict_address(&admin, &restricted_addr);
+            assert!(client.is_address_restricted(&restricted_addr));
+
+            // Admin unrestricts the address
+            client.unrestrict_address(&admin, &restricted_addr);
+
+            // Verify address is no longer restricted
+            assert!(!client.is_address_restricted(&restricted_addr));
+        }
+
+        #[test]
+        #[should_panic(expected = "Error(Contract, #5)")]
+        #[ignore] // OFAC functions not implemented
+        fn test_non_admin_cannot_restrict_address() {
+            let env = Env::default();
+            env.mock_all_auths();
+
+            let contract_id = env.register(StellarStreamContract, ());
+            let client = StellarStreamContractClient::new(&env, &contract_id);
+
+            let non_admin = Address::generate(&env);
+            let restricted_addr = Address::generate(&env);
+
+            // Non-admin tries to restrict an address - should panic
+            client.restrict_address(&non_admin, &restricted_addr);
+        }
+
+        #[test]
+        #[should_panic(expected = "Error(Contract, #20)")]
+        #[ignore] // OFAC functions not implemented
+        fn test_cannot_create_stream_to_restricted_address() {
+            let env = Env::default();
+            env.mock_all_auths();
+            env.ledger().with_mut(|li| li.timestamp = 100);
+
+            let contract_id = env.register(StellarStreamContract, ());
+            let client = StellarStreamContractClient::new(&env, &contract_id);
+
+            let admin = Address::generate(&env);
+            let sender = Address::generate(&env);
+            let restricted_receiver = Address::generate(&env);
+            let token_admin = Address::generate(&env);
+
+            set_admin_role(&env, &contract_id, &admin);
+
+            // Create token
+            let token_id = env.register_stellar_asset_contract(token_admin.clone());
+
+            // Mint tokens to sender
+            let token_client = token::StellarAssetClient::new(&env, &token_id);
+            token_client.mint(&sender, &1000);
+
+            // Admin restricts the receiver address
+            client.restrict_address(&admin, &restricted_receiver);
+
+            // Attempt to create stream to restricted address should panic
+            client.create_stream(
+                &sender,
+                &restricted_receiver,
+                &token_id,
+                &1000,
+                &100,
+                &200,
+                &CurveType::Linear,
+            );
+        }
+
+        #[test]
+        #[should_panic(expected = "Error(Contract, #20)")]
+        #[ignore] // OFAC functions not implemented
+        fn test_cannot_create_proposal_to_restricted_address() {
+            let env = Env::default();
+            env.mock_all_auths();
+            env.ledger().with_mut(|li| li.timestamp = 50);
+
+            let contract_id = env.register(StellarStreamContract, ());
+            let client = StellarStreamContractClient::new(&env, &contract_id);
+
+            let admin = Address::generate(&env);
+            let sender = Address::generate(&env);
+            let restricted_receiver = Address::generate(&env);
+            let token_admin = Address::generate(&env);
+
+            set_admin_role(&env, &contract_id, &admin);
+
+            // Create token
+            let token_id = env.register_stellar_asset_contract(token_admin.clone());
+
+            // Mint tokens to sender
+            let token_client = token::StellarAssetClient::new(&env, &token_id);
+            token_client.mint(&sender, &1000);
+
+            // Admin restricts the receiver address
+            client.restrict_address(&admin, &restricted_receiver);
+
+            // Attempt to create proposal to restricted address should panic
+            client.create_proposal(
+                &sender,
+                &restricted_receiver,
+                &token_id,
+                &1000,
+                &100,
+                &200,
+                &2,
+                &1000,
+            );
+        }
+
+        #[test]
+        #[should_panic(expected = "Error(Contract, #20)")]
+        #[ignore] // OFAC functions not implemented
+        fn test_cannot_transfer_receipt_to_restricted_address() {
+            let env = Env::default();
+            env.mock_all_auths();
+            env.ledger().with_mut(|li| li.timestamp = 100);
+
+            let contract_id = env.register(StellarStreamContract, ());
+            let client = StellarStreamContractClient::new(&env, &contract_id);
+
+            let admin = Address::generate(&env);
+            let sender = Address::generate(&env);
+            let receiver = Address::generate(&env);
+            let restricted_addr = Address::generate(&env);
+            let token_admin = Address::generate(&env);
+
+            set_admin_role(&env, &contract_id, &admin);
+
+            // Create token
+            let token_id = env.register_stellar_asset_contract(token_admin.clone());
+
+            // Mint tokens to sender
+            let token_client = token::StellarAssetClient::new(&env, &token_id);
+            token_client.mint(&sender, &1000);
+
+            // Create stream to valid receiver
+            let stream_id = client.create_stream(
+                &sender,
+                &receiver,
+                &token_id,
+                &1000,
+                &100,
+                &200,
+                &CurveType::Linear,
+            );
+
+            // Admin restricts an address
+            client.restrict_address(&admin, &restricted_addr);
+
+            // Attempt to transfer receipt to restricted address should panic
+            client.transfer_receipt(&stream_id, &receiver, &restricted_addr);
+        }
+
+        #[test]
+        #[ignore] // OFAC functions not implemented
+        fn test_get_restricted_addresses_list() {
+            let env = Env::default();
+            env.mock_all_auths();
+
+            let contract_id = env.register(StellarStreamContract, ());
+            let client = StellarStreamContractClient::new(&env, &contract_id);
+
+            let admin = Address::generate(&env);
+            let addr1 = Address::generate(&env);
+            let addr2 = Address::generate(&env);
+            let addr3 = Address::generate(&env);
+
+            set_admin_role(&env, &contract_id, &admin);
+
+            // Initially, no restricted addresses
+            let restricted = client.get_restricted_addresses();
+            assert_eq!(restricted.len(), 0);
+
+            // Admin restricts addresses
+            client.restrict_address(&admin, &addr1);
+            client.restrict_address(&admin, &addr2);
+            client.restrict_address(&admin, &addr3);
+
+            // Verify all addresses are in the list
+            let restricted = client.get_restricted_addresses();
+            assert_eq!(restricted.len(), 3);
+        }
+
+        #[test]
+        #[ignore] // OFAC functions not implemented
+        fn test_restrict_same_address_twice_is_idempotent() {
+            let env = Env::default();
+            env.mock_all_auths();
+
+            let contract_id = env.register(StellarStreamContract, ());
+            let client = StellarStreamContractClient::new(&env, &contract_id);
+
+            let admin = Address::generate(&env);
+            let restricted_addr = Address::generate(&env);
+
+            set_admin_role(&env, &contract_id, &admin);
+
+            // Restrict address first time
+            client.restrict_address(&admin, &restricted_addr);
+            let restricted_1 = client.get_restricted_addresses();
+            assert_eq!(restricted_1.len(), 1);
+
+            // Restrict same address again (should be idempotent)
+            client.restrict_address(&admin, &restricted_addr);
+            let restricted_2 = client.get_restricted_addresses();
+            assert_eq!(restricted_2.len(), 1);
+
+            // Verify address is still restricted
+            assert!(client.is_address_restricted(&restricted_addr));
+        }
+
+        #[test]
+        #[ignore] // OFAC functions not implemented
+        fn test_stream_creation_allowed_after_unrestriction() {
+            let env = Env::default();
+            env.mock_all_auths();
+            env.ledger().with_mut(|li| li.timestamp = 100);
+
+            let contract_id = env.register(StellarStreamContract, ());
+            let client = StellarStreamContractClient::new(&env, &contract_id);
+
+            let admin = Address::generate(&env);
+            let sender = Address::generate(&env);
+            let receiver = Address::generate(&env);
+            let token_admin = Address::generate(&env);
+
+            set_admin_role(&env, &contract_id, &admin);
+
+            // Create token
+            let token_id = env.register_stellar_asset_contract(token_admin.clone());
+
+            // Mint tokens to sender
+            let token_client = token::StellarAssetClient::new(&env, &token_id);
+            token_client.mint(&sender, &1000);
+
+            // Admin restricts the receiver
+            client.restrict_address(&admin, &receiver);
+
+            // Admin unrestricts the receiver
+            client.unrestrict_address(&admin, &receiver);
+
+            // Now stream creation should succeed
+            let stream_id = client.create_stream(
+                &sender,
+                &receiver,
+                &token_id,
+                &1000,
+                &100,
+                &200,
+                &CurveType::Linear,
+            );
+
+            // Verify stream was created (stream_id >= 0)
+            assert!(stream_id >= 0);
+        }
     } // end ofac_tests module
 }
