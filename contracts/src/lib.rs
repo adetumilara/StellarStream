@@ -3,22 +3,50 @@
 
 mod errors;
 mod flash_loan;
+mod interest;
 mod math;
 mod oracle;
 mod storage;
 mod types;
+mod vault;
+mod voting;
 
 #[cfg(test)]
+mod allowlist_test;
+#[cfg(test)]
+mod clawback_test;
+#[cfg(test)]
+mod dispute_test;
+#[cfg(test)]
 mod soulbound_test;
+#[cfg(test)]
+mod topup_test;
+#[cfg(test)]
+mod vault_test;
+#[cfg(test)]
+mod voting_test;
+
+// #[cfg(test)]
+// mod interest_test;
+
+// #[cfg(test)]
+// mod mock_vault;
+
+// #[cfg(test)]
+// mod vault_integration_test;
+
+#[cfg(test)]
+mod ttl_stress_test;
 
 use errors::Error;
 use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env, Vec};
 use storage::{PROPOSAL_COUNT, RECEIPT, STREAM_COUNT};
 use types::{
-    ContributorRequest, RequestCreatedEvent, RequestExecutedEvent, RequestKey, RequestStatus,
-    CurveType, DataKey, Milestone, ProposalApprovedEvent, ProposalCreatedEvent, ReceiptMetadata,
-    ReceiptTransferredEvent, Role, Stream, StreamCancelledEvent, StreamClaimEvent,
-    StreamCreatedEvent, StreamPausedEvent, StreamProposal, StreamReceipt, StreamUnpausedEvent,
+    ClawbackEvent, ContributorRequest, CurveType, DataKey, Milestone, ProposalApprovedEvent,
+    ProposalCreatedEvent, ReceiptMetadata, ReceiptTransferredEvent, RequestCreatedEvent,
+    RequestExecutedEvent, RequestKey, RequestStatus, Role, Stream, StreamCancelledEvent,
+    StreamClaimEvent, StreamCreatedEvent, StreamPausedEvent, StreamProposal, StreamReceipt,
+    StreamUnpausedEvent,
 };
 
 #[contract]
@@ -182,7 +210,10 @@ impl StellarStreamContract {
             oracle_max_staleness: 0,
             price_min: 0,
             price_max: 0,
-            is_soulbound: false, // Proposals default to non-soulbound
+            is_soulbound: false,     // Proposals default to non-soulbound
+            clawback_enabled: false, // Check at runtime if needed
+            arbiter: None,
+            is_frozen: false,
         };
 
         env.storage()
@@ -210,7 +241,7 @@ impl StellarStreamContract {
     }
 
     /// Create a new stream with optional soulbound locking
-    /// 
+    ///
     /// # Parameters
     /// - `is_soulbound`: Set to true to permanently bind this stream to the receiver's address.
     ///   Cannot be changed after stream creation. Irreversible.
@@ -237,11 +268,12 @@ impl StellarStreamContract {
             milestones,
             curve_type,
             is_soulbound,
+            None, // No vault
         )
     }
 
     /// Create a new stream with milestones and optional soulbound locking
-    /// 
+    ///
     /// # Parameters
     /// - `is_soulbound`: Set to true to permanently bind this stream to the receiver's address.
     ///   Cannot be changed after stream creation. Irreversible.
@@ -256,6 +288,7 @@ impl StellarStreamContract {
         milestones: Vec<Milestone>,
         curve_type: CurveType,
         is_soulbound: bool,
+        vault_address: Option<Address>,
     ) -> Result<u64, Error> {
         sender.require_auth();
 
@@ -267,8 +300,26 @@ impl StellarStreamContract {
             return Err(Error::InvalidAmount);
         }
 
-        let token_client = token::Client::new(&env, &token);
-        token_client.transfer(&sender, &env.current_contract_address(), &total_amount);
+        // Validate vault if provided
+        let vault_shares = if let Some(ref vault) = vault_address {
+            // Check if vault is approved
+            if !Self::is_vault_approved(env.clone(), vault.clone()) {
+                return Err(Error::Unauthorized);
+            }
+
+            // Transfer tokens to contract first
+            let token_client = token::Client::new(&env, &token);
+            token_client.transfer(&sender, &env.current_contract_address(), &total_amount);
+
+            // Deposit to vault and get shares
+            vault::deposit_to_vault(&env, vault, &token, total_amount)
+                .map_err(|_| Error::InvalidAmount)?
+        } else {
+            // Standard stream without vault
+            let token_client = token::Client::new(&env, &token);
+            token_client.transfer(&sender, &env.current_contract_address(), &total_amount);
+            0
+        };
 
         let stream_id: u64 = env.storage().instance().get(&STREAM_COUNT).unwrap_or(0);
         let next_id = stream_id + 1;
@@ -282,7 +333,7 @@ impl StellarStreamContract {
             end_time,
             withdrawn_amount: 0,
             interest_strategy: 0,
-            vault_address: None,
+            vault_address: vault_address.clone(),
             deposited_principal: total_amount,
             metadata: None,
             withdrawn: 0,
@@ -300,12 +351,27 @@ impl StellarStreamContract {
             price_min: 0,
             price_max: 0,
             is_soulbound,
+            clawback_enabled: false, // TODO: Check token flags
+            arbiter: None,
+            is_frozen: false,
         };
 
+        let stream_key = (STREAM_COUNT, stream_id);
+        
+        // Extend contract instance TTL to ensure long-term accessibility
+        Self::extend_contract_ttl(&env);
+        
         env.storage()
             .instance()
-            .set(&(STREAM_COUNT, stream_id), &stream);
+            .set(&stream_key, &stream);
         env.storage().instance().set(&STREAM_COUNT, &next_id);
+
+        // Store vault shares if vault is used
+        if vault_shares > 0 {
+            env.storage()
+                .instance()
+                .set(&DataKey::VaultShares(stream_id), &vault_shares);
+        }
 
         // If soulbound, emit event and add to index
         if is_soulbound {
@@ -461,6 +527,70 @@ impl StellarStreamContract {
         // Update receiver
         stream.receiver = new_receiver.clone();
         env.storage().instance().set(&stream_key, &stream);
+
+        Ok(())
+    }
+
+    /// Top up an active stream with additional funds
+    pub fn top_up_stream(
+        env: Env,
+        stream_id: u64,
+        sender: Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        sender.require_auth();
+
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        let key = (STREAM_COUNT, stream_id);
+        let mut stream: Stream = env
+            .storage()
+            .instance()
+            .get(&key)
+            .ok_or(Error::StreamNotFound)?;
+
+        if stream.sender != sender {
+            return Err(Error::Unauthorized);
+        }
+
+        if stream.cancelled {
+            return Err(Error::AlreadyCancelled);
+        }
+
+        let current_time = env.ledger().timestamp();
+        if current_time >= stream.end_time {
+            return Err(Error::StreamEnded);
+        }
+
+        // Transfer tokens from sender
+        let token_client = token::Client::new(&env, &stream.token);
+        token_client.transfer(&sender, &env.current_contract_address(), &amount);
+
+        // Calculate new end time based on flow rate
+        let total_duration = stream.end_time.saturating_sub(stream.start_time);
+        let flow_rate = stream.total_amount / total_duration as i128;
+
+        let new_total = stream.total_amount + amount;
+        let additional_duration = amount / flow_rate;
+        let new_end_time = stream.end_time + additional_duration as u64;
+
+        stream.total_amount = new_total;
+        stream.end_time = new_end_time;
+        env.storage().instance().set(&key, &stream);
+
+        env.events().publish(
+            (symbol_short!("topup"), stream_id),
+            types::StreamToppedUpEvent {
+                stream_id,
+                sender,
+                amount,
+                new_total,
+                new_end_time,
+                timestamp: current_time,
+            },
+        );
 
         Ok(())
     }
