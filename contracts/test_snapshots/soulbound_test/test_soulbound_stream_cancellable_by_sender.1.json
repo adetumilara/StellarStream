@@ -342,10 +342,24 @@
                           "map": [
                             {
                               "key": {
+                                "symbol": "arbiter"
+                              },
+                              "val": "void"
+                            },
+                            {
+                              "key": {
                                 "symbol": "cancelled"
                               },
                               "val": {
                                 "bool": true
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "clawback_enabled"
+                              },
+                              "val": {
+                                "bool": false
                               }
                             },
                             {
@@ -381,6 +395,14 @@
                               },
                               "val": {
                                 "u32": 0
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "is_frozen"
+                              },
+                              "val": {
+                                "bool": false
                               }
                             },
                             {
@@ -550,7 +572,7 @@
                               "val": {
                                 "i128": {
                                   "hi": 0,
-                                  "lo": 250000
+                                  "lo": 0
                                 }
                               }
                             },
@@ -561,7 +583,7 @@
                               "val": {
                                 "i128": {
                                   "hi": 0,
-                                  "lo": 0
+                                  "lo": 250000
                                 }
                               }
                             }

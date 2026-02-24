@@ -3,13 +3,40 @@
 
 mod errors;
 mod flash_loan;
+mod interest;
 mod math;
 mod oracle;
 mod storage;
 mod types;
+mod vault;
+mod voting;
 
 #[cfg(test)]
+mod allowlist_test;
+#[cfg(test)]
+mod clawback_test;
+#[cfg(test)]
+mod dispute_test;
+#[cfg(test)]
 mod soulbound_test;
+#[cfg(test)]
+mod topup_test;
+#[cfg(test)]
+mod vault_test;
+#[cfg(test)]
+mod voting_test;
+
+// #[cfg(test)]
+// mod interest_test;
+
+// #[cfg(test)]
+// mod mock_vault;
+
+// #[cfg(test)]
+// mod vault_integration_test;
+
+#[cfg(test)]
+mod ttl_stress_test;
 
 use errors::Error;
 use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env, Vec};
@@ -19,6 +46,13 @@ use types::{
     ReceiptMetadata, ReceiptTransferredEvent, RequestCreatedEvent, RequestExecutedEvent,
     RequestKey, RequestStatus, Role, Stream, StreamCancelledEvent, StreamClaimEvent,
     StreamCreatedEvent, StreamPausedEvent, StreamProposal, StreamReceipt, StreamUnpausedEvent,
+use storage::{PROPOSAL_COUNT, RECEIPT, STREAM_COUNT};
+use types::{
+    ClawbackEvent, ContributorRequest, CurveType, DataKey, Milestone, ProposalApprovedEvent,
+    ProposalCreatedEvent, ReceiptMetadata, ReceiptTransferredEvent, RequestCreatedEvent,
+    RequestExecutedEvent, RequestKey, RequestStatus, Role, Stream, StreamCancelledEvent,
+    StreamClaimEvent, StreamCreatedEvent, StreamPausedEvent, StreamProposal, StreamReceipt,
+    StreamUnpausedEvent,
 };
 
 #[contract]
@@ -39,9 +73,7 @@ impl StellarStreamContract {
     ) -> Result<u64, Error> {
         sender.require_auth();
 
-        // OFAC Compliance: Check if receiver is restricted
-        Self::validate_receiver(&env, &receiver)?;
-
+        // Validate time range
         if start_time >= end_time {
             return Err(Error::InvalidTimeRange);
         }
@@ -184,7 +216,10 @@ impl StellarStreamContract {
             oracle_max_staleness: 0,
             price_min: 0,
             price_max: 0,
-            is_soulbound: false, // Proposals default to non-soulbound
+            is_soulbound: false,     // Proposals default to non-soulbound
+            clawback_enabled: false, // Check at runtime if needed
+            arbiter: None,
+            is_frozen: false,
         };
 
         env.storage()
@@ -239,6 +274,7 @@ impl StellarStreamContract {
             milestones,
             curve_type,
             is_soulbound,
+            None, // No vault
         )
     }
 
@@ -258,12 +294,11 @@ impl StellarStreamContract {
         milestones: Vec<Milestone>,
         curve_type: CurveType,
         is_soulbound: bool,
+        vault_address: Option<Address>,
     ) -> Result<u64, Error> {
         sender.require_auth();
 
-        // OFAC Compliance: Check if receiver is restricted
-        Self::validate_receiver(&env, &receiver)?;
-
+        // Validate time range
         if start_time >= end_time {
             return Err(Error::InvalidTimeRange);
         }
@@ -271,8 +306,26 @@ impl StellarStreamContract {
             return Err(Error::InvalidAmount);
         }
 
-        let token_client = token::Client::new(&env, &token);
-        token_client.transfer(&sender, &env.current_contract_address(), &total_amount);
+        // Validate vault if provided
+        let vault_shares = if let Some(ref vault) = vault_address {
+            // Check if vault is approved
+            if !Self::is_vault_approved(env.clone(), vault.clone()) {
+                return Err(Error::Unauthorized);
+            }
+
+            // Transfer tokens to contract first
+            let token_client = token::Client::new(&env, &token);
+            token_client.transfer(&sender, &env.current_contract_address(), &total_amount);
+
+            // Deposit to vault and get shares
+            vault::deposit_to_vault(&env, vault, &token, total_amount)
+                .map_err(|_| Error::InvalidAmount)?
+        } else {
+            // Standard stream without vault
+            let token_client = token::Client::new(&env, &token);
+            token_client.transfer(&sender, &env.current_contract_address(), &total_amount);
+            0
+        };
 
         let stream_id: u64 = env.storage().instance().get(&STREAM_COUNT).unwrap_or(0);
         let next_id = stream_id + 1;
@@ -286,7 +339,7 @@ impl StellarStreamContract {
             end_time,
             withdrawn_amount: 0,
             interest_strategy: 0,
-            vault_address: None,
+            vault_address: vault_address.clone(),
             deposited_principal: total_amount,
             metadata: None,
             withdrawn: 0,
@@ -304,12 +357,27 @@ impl StellarStreamContract {
             price_min: 0,
             price_max: 0,
             is_soulbound,
+            clawback_enabled: false, // TODO: Check token flags
+            arbiter: None,
+            is_frozen: false,
         };
 
+        let stream_key = (STREAM_COUNT, stream_id);
+        
+        // Extend contract instance TTL to ensure long-term accessibility
+        Self::extend_contract_ttl(&env);
+        
         env.storage()
             .instance()
-            .set(&(STREAM_COUNT, stream_id), &stream);
+            .set(&stream_key, &stream);
         env.storage().instance().set(&STREAM_COUNT, &next_id);
+
+        // Store vault shares if vault is used
+        if vault_shares > 0 {
+            env.storage()
+                .instance()
+                .set(&DataKey::VaultShares(stream_id), &vault_shares);
+        }
 
         // If soulbound, emit event and add to index
         if is_soulbound {
@@ -348,101 +416,189 @@ impl StellarStreamContract {
         Ok(stream_id)
     }
 
-    pub fn create_usd_pegged_stream(
+    pub fn initialize(env: Env, admin: Address) {
+        admin.require_auth();
+        
+        // Set admin role
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        
+        // Grant all roles to admin
+        env.storage().instance().set(&DataKey::Role(admin.clone(), Role::Admin), &true);
+        env.storage().instance().set(&DataKey::Role(admin.clone(), Role::Pauser), &true);
+        env.storage().instance().set(&DataKey::Role(admin.clone(), Role::TreasuryManager), &true);
+    }
+
+    pub fn grant_role(env: Env, admin: Address, target: Address, role: Role) {
+        admin.require_auth();
+        
+        // Check if admin has Admin role
+        let has_admin_role: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::Role(admin, Role::Admin))
+            .unwrap_or(false);
+            
+        if !has_admin_role {
+            panic!("Unauthorized");
+        }
+        
+        env.storage().instance().set(&DataKey::Role(target, role), &true);
+    }
+
+    pub fn revoke_role(env: Env, admin: Address, target: Address, role: Role) {
+        admin.require_auth();
+        
+        // Check if admin has Admin role
+        let has_admin_role: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::Role(admin, Role::Admin))
+            .unwrap_or(false);
+            
+        if !has_admin_role {
+            panic!("Unauthorized");
+        }
+        
+        env.storage().instance().remove(&DataKey::Role(target, role));
+    }
+
+    pub fn check_role(env: Env, address: Address, role: Role) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Role(address, role))
+            .unwrap_or(false)
+    }
+
+    pub fn get_admin(env: Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set")
+    }
+
+    fn mint_receipt(env: &Env, stream_id: u64, owner: &Address) {
+        let receipt = StreamReceipt {
+            stream_id,
+            owner: owner.clone(),
+            minted_at: env.ledger().timestamp(),
+        };
+        env.storage()
+            .instance()
+            .set(&(RECEIPT, stream_id), &receipt);
+    }
+
+    pub fn get_stream(env: Env, stream_id: u64) -> Result<Stream, Error> {
+        env.storage()
+            .instance()
+            .get(&(STREAM_COUNT, stream_id))
+            .ok_or(Error::StreamNotFound)
+    }
+
+    pub fn get_soulbound_streams(env: Env) -> Vec<u64> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SoulboundStreams)
+            .unwrap_or(Vec::new(&env))
+    }
+
+    pub fn transfer_receiver(
         env: Env,
+        stream_id: u64,
+        caller: Address,
+        new_receiver: Address,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+
+        let stream_key = (STREAM_COUNT, stream_id);
+        let mut stream: Stream = env
+            .storage()
+            .instance()
+            .get(&stream_key)
+            .ok_or(Error::StreamNotFound)?;
+
+        // SOULBOUND CHECK FIRST
+        if stream.is_soulbound {
+            return Err(Error::StreamIsSoulbound);
+        }
+
+        // Authorization check: only sender can transfer receiver
+        if stream.sender != caller {
+            return Err(Error::Unauthorized);
+        }
+
+        if stream.cancelled {
+            return Err(Error::AlreadyCancelled);
+        }
+
+        // Update receiver
+        stream.receiver = new_receiver.clone();
+        env.storage().instance().set(&stream_key, &stream);
+
+        Ok(())
+    }
+
+    /// Top up an active stream with additional funds
+    pub fn top_up_stream(
+        env: Env,
+        stream_id: u64,
         sender: Address,
-        receiver: Address,
-        token: Address,
-        usd_amount: i128,
-        start_time: u64,
-        end_time: u64,
-        oracle_address: Address,
-        max_staleness: u64,
-        min_price: i128,
-        max_price: i128,
-    ) -> Result<u64, Error> {
+        amount: i128,
+    ) -> Result<(), Error> {
         sender.require_auth();
 
-        // OFAC Compliance: Check if receiver is restricted
-        Self::validate_receiver(&env, &receiver)?;
-
-        if start_time >= end_time {
-            return Err(Error::InvalidTimeRange);
-        }
-        if usd_amount <= 0 {
+        if amount <= 0 {
             return Err(Error::InvalidAmount);
         }
 
-        // Get initial price to calculate deposit amount
-        let price = oracle::get_price(&env, &oracle_address, max_staleness)
-            .map_err(|_| Error::OracleFailed)?;
+        let key = (STREAM_COUNT, stream_id);
+        let mut stream: Stream = env
+            .storage()
+            .instance()
+            .get(&key)
+            .ok_or(Error::StreamNotFound)?;
 
-        // Check price bounds
-        if price < min_price || price > max_price {
-            return Err(Error::PriceOutOfBounds);
+        if stream.sender != sender {
+            return Err(Error::Unauthorized);
         }
 
-        // Calculate initial token amount
-        let initial_amount =
-            oracle::calculate_token_amount(usd_amount, price).map_err(|_| Error::InvalidAmount)?;
+        if stream.cancelled {
+            return Err(Error::AlreadyCancelled);
+        }
 
-        // Transfer tokens
-        let token_client = token::Client::new(&env, &token);
-        token_client.transfer(&sender, &env.current_contract_address(), &initial_amount);
+        let current_time = env.ledger().timestamp();
+        if current_time >= stream.end_time {
+            return Err(Error::StreamEnded);
+        }
 
-        let stream_id: u64 = env.storage().instance().get(&STREAM_COUNT).unwrap_or(0);
-        let next_id = stream_id + 1;
+        // Transfer tokens from sender
+        let token_client = token::Client::new(&env, &stream.token);
+        token_client.transfer(&sender, &env.current_contract_address(), &amount);
 
-        let stream = Stream {
-            sender: sender.clone(),
-            receiver: receiver.clone(),
-            token: token.clone(),
-            total_amount: initial_amount,
-            start_time,
-            end_time,
-            withdrawn_amount: 0,
-            interest_strategy: 0,
-            vault_address: None,
-            deposited_principal: initial_amount,
-            metadata: None,
-            withdrawn: 0,
-            cancelled: false,
-            receipt_owner: receiver.clone(),
-            is_paused: false,
-            paused_time: 0,
-            total_paused_duration: 0,
-            milestones: Vec::new(&env),
-            curve_type: CurveType::Linear,
-            is_usd_pegged: true,
-            usd_amount,
-            oracle_address,
-            oracle_max_staleness: max_staleness,
-            price_min: min_price,
-            price_max: max_price,
-            is_soulbound: false, // USD-pegged streams default to non-soulbound
-        };
+        // Calculate new end time based on flow rate
+        let total_duration = stream.end_time.saturating_sub(stream.start_time);
+        let flow_rate = stream.total_amount / total_duration as i128;
 
-        env.storage()
-            .instance()
-            .set(&(STREAM_COUNT, stream_id), &stream);
-        env.storage().instance().set(&STREAM_COUNT, &next_id);
+        let new_total = stream.total_amount + amount;
+        let additional_duration = amount / flow_rate;
+        let new_end_time = stream.end_time + additional_duration as u64;
+
+        stream.total_amount = new_total;
+        stream.end_time = new_end_time;
+        env.storage().instance().set(&key, &stream);
 
         env.events().publish(
-            (symbol_short!("create"), sender.clone()),
-            StreamCreatedEvent {
+            (symbol_short!("topup"), stream_id),
+            types::StreamToppedUpEvent {
                 stream_id,
                 sender,
-                receiver: receiver.clone(),
-                token,
-                total_amount: initial_amount,
-                start_time,
-                end_time,
-                timestamp: env.ledger().timestamp(),
+                amount,
+                new_total,
+                new_end_time,
+                timestamp: current_time,
             },
         );
-        Self::mint_receipt(&env, stream_id, &receiver);
 
-        Ok(stream_id)
+        Ok(())
     }
 
     pub fn pause_stream(env: Env, stream_id: u64, caller: Address) -> Result<(), Error> {
@@ -468,16 +624,6 @@ impl StellarStreamContract {
         stream.is_paused = true;
         stream.paused_time = env.ledger().timestamp();
         env.storage().instance().set(&key, &stream);
-
-        // Emit StreamPausedEvent
-        env.events().publish(
-            (symbol_short!("pause"), caller.clone()),
-            StreamPausedEvent {
-                stream_id,
-                pauser: caller,
-                timestamp: env.ledger().timestamp(),
-            },
-        );
 
         Ok(())
     }
@@ -510,183 +656,11 @@ impl StellarStreamContract {
 
         env.storage().instance().set(&key, &stream);
 
-        // Emit StreamUnpausedEvent
-        env.events().publish(
-            (symbol_short!("unpause"), caller.clone()),
-            StreamUnpausedEvent {
-                stream_id,
-                unpauser: caller,
-                paused_duration: pause_duration,
-                timestamp: current_time,
-            },
-        );
-
         Ok(())
-    }
-
-    fn mint_receipt(env: &Env, stream_id: u64, owner: &Address) {
-        let receipt = StreamReceipt {
-            stream_id,
-            owner: owner.clone(),
-            minted_at: env.ledger().timestamp(),
-        };
-        env.storage()
-            .instance()
-            .set(&(RECEIPT, stream_id), &receipt);
-    }
-
-    pub fn transfer_receipt(
-        env: Env,
-        stream_id: u64,
-        from: Address,
-        to: Address,
-    ) -> Result<(), Error> {
-        from.require_auth();
-
-        // OFAC Compliance: Check if recipient is restricted
-        Self::validate_receiver(&env, &to)?;
-
-        let receipt_key = (RECEIPT, stream_id);
-        let receipt: StreamReceipt = env
-            .storage()
-            .instance()
-            .get(&receipt_key)
-            .ok_or(Error::StreamNotFound)?;
-
-        if receipt.owner != from {
-            return Err(Error::NotReceiptOwner);
-        }
-
-        let stream_key = (STREAM_COUNT, stream_id);
-        let mut stream: Stream = env
-            .storage()
-            .instance()
-            .get(&stream_key)
-            .ok_or(Error::StreamNotFound)?;
-
-        stream.receipt_owner = to.clone();
-        env.storage().instance().set(&stream_key, &stream);
-
-        let new_receipt = StreamReceipt {
-            stream_id,
-            owner: to.clone(),
-            minted_at: receipt.minted_at,
-        };
-        env.storage().instance().set(&receipt_key, &new_receipt);
-
-        // Emit ReceiptTransferredEvent
-        env.events().publish(
-            (symbol_short!("transfer"), from.clone()),
-            ReceiptTransferredEvent {
-                stream_id,
-                from,
-                to,
-                timestamp: env.ledger().timestamp(),
-            },
-        );
-
-        Ok(())
-    }
-
-    /// Transfer stream receiver to a new address
-    /// This changes the actual receiver field, not just the receipt owner
-    /// BLOCKED for soulbound streams - soulbound check precedes all other validation
-    pub fn transfer_receiver(
-        env: Env,
-        stream_id: u64,
-        caller: Address,
-        new_receiver: Address,
-    ) -> Result<(), Error> {
-        caller.require_auth();
-
-        let stream_key = (STREAM_COUNT, stream_id);
-        let mut stream: Stream = env
-            .storage()
-            .instance()
-            .get(&stream_key)
-            .ok_or(Error::StreamNotFound)?;
-
-        // SOULBOUND CHECK FIRST: This is a hard protocol invariant, not a permission check.
-        // Even the sender cannot override this. If a soulbound stream needs to be "transferred",
-        // the correct approach is to cancel it and create a new stream.
-        if stream.is_soulbound {
-            return Err(Error::StreamIsSoulbound);
-        }
-
-        // Authorization check: only sender can transfer receiver
-        if stream.sender != caller {
-            return Err(Error::Unauthorized);
-        }
-
-        if stream.cancelled {
-            return Err(Error::AlreadyCancelled);
-        }
-
-        // Update receiver
-        stream.receiver = new_receiver.clone();
-        env.storage().instance().set(&stream_key, &stream);
-
-        // Emit event
-        env.events().publish(
-            (symbol_short!("transfer"), symbol_short!("receiver")),
-            (stream_id, new_receiver),
-        );
-
-        Ok(())
-    }
-
-    /// Get all soulbound stream IDs
-    /// Useful for indexers and compliance audits
-    pub fn get_soulbound_streams(env: Env) -> Vec<u64> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::SoulboundStreams)
-            .unwrap_or(Vec::new(&env))
-    }
-
-    // SOULBOUND INVARIANT NOTE: If delegate_receiver, assign_stream, or merge_streams
-    // are added in future, they MUST apply the is_soulbound guard before any other logic.
-    // See: Issue #12 - Soulbound streams must remain locked to original receiver under ALL circumstances.
-
-    pub fn get_receipt(env: Env, stream_id: u64) -> Result<StreamReceipt, Error> {
-        env.storage()
-            .instance()
-            .get(&(RECEIPT, stream_id))
-            .ok_or(Error::StreamNotFound)
-    }
-
-    pub fn get_receipt_metadata(env: Env, stream_id: u64) -> Result<ReceiptMetadata, Error> {
-        let stream: Stream = env
-            .storage()
-            .instance()
-            .get(&(STREAM_COUNT, stream_id))
-            .ok_or(Error::StreamNotFound)?;
-
-        let current_time = env.ledger().timestamp();
-        let unlocked = Self::calculate_unlocked(&stream, current_time);
-        let locked = stream.total_amount - unlocked;
-
-        Ok(ReceiptMetadata {
-            stream_id,
-            locked_balance: locked,
-            unlocked_balance: unlocked - stream.withdrawn,
-            total_amount: stream.total_amount,
-            token: stream.token,
-        })
     }
 
     pub fn withdraw(env: Env, stream_id: u64, caller: Address) -> Result<i128, Error> {
         caller.require_auth();
-
-        let receipt: StreamReceipt = env
-            .storage()
-            .instance()
-            .get(&(RECEIPT, stream_id))
-            .ok_or(Error::StreamNotFound)?;
-
-        if receipt.owner != caller {
-            return Err(Error::NotReceiptOwner);
-        }
 
         let key = (STREAM_COUNT, stream_id);
         let mut stream: Stream = env
@@ -694,6 +668,10 @@ impl StellarStreamContract {
             .instance()
             .get(&key)
             .ok_or(Error::StreamNotFound)?;
+
+        if stream.receiver != caller {
+            return Err(Error::Unauthorized);
+        }
 
         if stream.cancelled {
             return Err(Error::AlreadyCancelled);
@@ -703,33 +681,8 @@ impl StellarStreamContract {
         }
 
         let current_time = env.ledger().timestamp();
-
-        // For USD-pegged streams, calculate based on current price
-        let to_withdraw = if stream.is_usd_pegged {
-            // Get current price from oracle
-            let price =
-                oracle::get_price(&env, &stream.oracle_address, stream.oracle_max_staleness)
-                    .map_err(|_| Error::OracleStalePrice)?;
-
-            // Check price bounds
-            if price < stream.price_min || price > stream.price_max {
-                return Err(Error::PriceOutOfBounds);
-            }
-
-            // Calculate unlocked USD amount
-            let unlocked_usd =
-                Self::calculate_unlocked_usd(&stream, current_time, stream.usd_amount);
-
-            // Convert to token amount at current price
-            let unlocked_tokens = oracle::calculate_token_amount(unlocked_usd, price)
-                .map_err(|_| Error::InvalidAmount)?;
-
-            unlocked_tokens - stream.withdrawn_amount
-        } else {
-            // Standard stream
-            let unlocked = Self::calculate_unlocked(&stream, current_time);
-            unlocked - stream.withdrawn_amount
-        };
+        let unlocked = Self::calculate_unlocked(&stream, current_time);
+        let to_withdraw = unlocked - stream.withdrawn_amount;
 
         if to_withdraw <= 0 {
             return Err(Error::InsufficientBalance);
@@ -745,18 +698,6 @@ impl StellarStreamContract {
             &to_withdraw,
         );
 
-        // Emit StreamClaimEvent
-        env.events().publish(
-            (symbol_short!("claim"), stream.receiver.clone()),
-            StreamClaimEvent {
-                stream_id,
-                claimer: stream.receiver,
-                amount: to_withdraw,
-                total_claimed: stream.withdrawn_amount,
-                timestamp: current_time,
-            },
-        );
-
         Ok(to_withdraw)
     }
 
@@ -770,13 +711,7 @@ impl StellarStreamContract {
             .get(&key)
             .ok_or(Error::StreamNotFound)?;
 
-        let receipt: StreamReceipt = env
-            .storage()
-            .instance()
-            .get(&(RECEIPT, stream_id))
-            .ok_or(Error::StreamNotFound)?;
-
-        if stream.sender != caller && receipt.owner != caller {
+        if stream.sender != caller && stream.receiver != caller {
             return Err(Error::Unauthorized);
         }
         if stream.cancelled {
@@ -785,18 +720,18 @@ impl StellarStreamContract {
 
         let current_time = env.ledger().timestamp();
         let unlocked = Self::calculate_unlocked(&stream, current_time);
-        let to_receiver = unlocked - stream.withdrawn;
+        let to_receiver = unlocked - stream.withdrawn_amount;
         let to_sender = stream.total_amount - unlocked;
 
         stream.cancelled = true;
-        stream.withdrawn = unlocked;
+        stream.withdrawn_amount = unlocked;
         env.storage().instance().set(&key, &stream);
 
         let token_client = token::Client::new(&env, &stream.token);
         if to_receiver > 0 {
             token_client.transfer(
                 &env.current_contract_address(),
-                &receipt.owner,
+                &stream.receiver,
                 &to_receiver,
             );
         }
@@ -804,33 +739,7 @@ impl StellarStreamContract {
             token_client.transfer(&env.current_contract_address(), &stream.sender, &to_sender);
         }
 
-        // Emit StreamCancelledEvent
-        env.events().publish(
-            (symbol_short!("cancel"), caller.clone()),
-            StreamCancelledEvent {
-                stream_id,
-                canceller: caller,
-                to_receiver,
-                to_sender,
-                timestamp: current_time,
-            },
-        );
-
         Ok(())
-    }
-
-    pub fn get_stream(env: Env, stream_id: u64) -> Result<Stream, Error> {
-        env.storage()
-            .instance()
-            .get(&(STREAM_COUNT, stream_id))
-            .ok_or(Error::StreamNotFound)
-    }
-
-    pub fn get_proposal(env: Env, proposal_id: u64) -> Result<StreamProposal, Error> {
-        env.storage()
-            .instance()
-            .get(&(PROPOSAL_COUNT, proposal_id))
-            .ok_or(Error::ProposalNotFound)
     }
 
     fn calculate_unlocked(stream: &Stream, current_time: u64) -> i128 {
@@ -859,7 +768,7 @@ impl StellarStreamContract {
         let duration = (stream.end_time - stream.start_time) as i128;
 
         // Calculate base unlocked amount based on curve type
-        let base_unlocked = match stream.curve_type {
+        match stream.curve_type {
             CurveType::Linear => (stream.total_amount * effective_elapsed) / duration,
             CurveType::Exponential => {
                 // Use exponential curve with overflow protection
@@ -874,50 +783,6 @@ impl StellarStreamContract {
                 )
                 .unwrap_or((stream.total_amount * effective_elapsed) / duration)
             }
-        };
-
-        if stream.milestones.is_empty() {
-            return base_unlocked;
-        }
-
-        let mut milestone_cap = 0i128;
-        for milestone in stream.milestones.iter() {
-            if effective_time >= milestone.timestamp {
-                let cap = (stream.total_amount * milestone.percentage as i128) / 100;
-                if cap > milestone_cap {
-                    milestone_cap = cap;
-                }
-            }
-        }
-
-        if base_unlocked < milestone_cap {
-            base_unlocked
-        } else {
-            milestone_cap
-        }
-    }
-
-    fn calculate_unlocked_usd(stream: &Stream, current_time: u64, total_usd: i128) -> i128 {
-        if current_time <= stream.start_time {
-            return 0;
-        }
-
-        let mut effective_time = current_time;
-        if stream.is_paused {
-            effective_time = stream.paused_time;
-        }
-
-        let adjusted_end = stream.end_time + stream.total_paused_duration;
-        if effective_time >= adjusted_end {
-            return total_usd;
-        }
-
-        let elapsed = (effective_time - stream.start_time) as i128;
-        let paused = stream.total_paused_duration as i128;
-        let effective_elapsed = elapsed - paused;
-
-        if effective_elapsed <= 0 {
-            return 0;
         }
 
         let duration = (stream.end_time - stream.start_time) as i128;
@@ -1079,7 +944,6 @@ impl StellarStreamContract {
             request.start_time,
             request.start_time + request.duration,
             CurveType::Linear,
-            false, // Contributor requests default to non-soulbound
         )?;
         env.events().publish(
             (
@@ -1102,6 +966,13 @@ impl StellarStreamContract {
             .get(&RequestKey::Request(request_id))
     }
 }
+
+// Contract metadata for explorer display (Stellar.Expert, etc.)
+soroban_sdk::contractmeta!(
+    desc = "StellarStream: Token streaming with multi-sig proposals, dynamic vesting curves (linear/exponential), yield optimization, and OFAC compliance. Create, manage, and withdraw from streams with flexible approval workflows.",
+    version = "0.1.0",
+    name = "StellarStream"
+);
 
 #[cfg(test)]
 mod test {
@@ -1303,7 +1174,6 @@ mod test {
             &100,
             &200,
             &CurveType::Linear,
-            &false,
         );
 
         assert_eq!(stream_id, 0);
@@ -1344,7 +1214,6 @@ mod test {
             &100,
             &200,
             &CurveType::Linear,
-            &false,
         );
 
         client.transfer_receipt(&stream_id, &receiver, &new_owner);
@@ -1382,7 +1251,6 @@ mod test {
             &100,
             &200,
             &CurveType::Linear,
-            &false,
         );
 
         client.transfer_receipt(&stream_id, &receiver, &new_owner);
@@ -1419,7 +1287,6 @@ mod test {
             &100,
             &200,
             &CurveType::Linear,
-            &false,
         );
 
         let metadata = client.get_receipt_metadata(&stream_id);
@@ -1522,7 +1389,6 @@ mod test {
             &100,
             &300,
             &CurveType::Linear,
-            &false,
         );
 
         env.ledger().with_mut(|li| li.timestamp = 150);
@@ -1565,7 +1431,6 @@ mod test {
             &100,
             &300,
             &CurveType::Linear,
-            &false,
         );
 
         client.pause_stream(&stream_id, &sender);
@@ -1601,7 +1466,6 @@ mod test {
             &100,
             &300,
             &CurveType::Linear,
-            &false,
         );
 
         env.ledger().with_mut(|li| li.timestamp = 150);
@@ -1666,7 +1530,6 @@ mod test {
             &360,
             &milestones,
             &CurveType::Linear,
-            &false,
         );
 
         env.ledger().with_mut(|li| li.timestamp = 45);
@@ -1714,7 +1577,6 @@ mod test {
             &200,
             &milestones,
             &CurveType::Linear,
-            &false,
         );
 
         env.ledger().with_mut(|li| li.timestamp = 50);
@@ -1760,7 +1622,6 @@ mod test {
             &100,
             &200,
             &CurveType::Linear,
-            &false,
         );
 
         assert_eq!(stream_id, 0);
@@ -1792,7 +1653,6 @@ mod test {
             &100,
             &200,
             &CurveType::Linear,
-            &false,
         );
 
         // Withdraw - should emit claim event
@@ -1826,7 +1686,6 @@ mod test {
             &100,
             &200,
             &CurveType::Linear,
-            &false,
         );
 
         // Cancel - should emit cancel event
@@ -1859,7 +1718,6 @@ mod test {
             &100,
             &200,
             &CurveType::Linear,
-            &false,
         );
 
         // Transfer receipt - should emit transfer event
@@ -1892,7 +1750,6 @@ mod test {
             &100,
             &300,
             &CurveType::Linear,
-            &false,
         );
 
         // Pause stream - should emit pause event
@@ -1925,7 +1782,6 @@ mod test {
             &100,
             &300,
             &CurveType::Linear,
-            &false,
         );
 
         client.pause_stream(&stream_id, &sender);
@@ -1994,7 +1850,6 @@ mod test {
             &0,
             &100,
             &CurveType::Exponential,
-            &false,
         );
 
         // At 50% time: should have ~25% unlocked (0.5^2 = 0.25)

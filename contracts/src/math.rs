@@ -1,3 +1,5 @@
+#![allow(unexpected_cfgs)]
+
 /// Calculate unlocked amount with precision-safe rounding
 /// Always rounds DOWN to favor contract solvency
 #[allow(dead_code)]
