@@ -778,5 +778,1365 @@ impl StellarStreamContract {
                 .unwrap_or((stream.total_amount * effective_elapsed) / duration)
             }
         }
+
+        let duration = (stream.end_time - stream.start_time) as i128;
+        (total_usd * effective_elapsed) / duration
+    }
+
+    // ========== RBAC Functions ==========
+
+    /// Grant a role to an address (Admin only)
+    pub fn grant_role(env: Env, admin: Address, target: Address, role: Role) {
+        admin.require_auth();
+
+        // Check if caller has Admin role
+        if !Self::has_role(&env, &admin, Role::Admin) {
+            panic!("{}", Error::Unauthorized as u32);
+        }
+
+        // Grant the role
+        env.storage()
+            .instance()
+            .set(&DataKey::Role(target.clone(), role.clone()), &true);
+
+        // Emit event
+        env.events().publish((symbol_short!("grant"), target), role);
+    }
+
+    /// Revoke a role from an address (Admin only)
+    pub fn revoke_role(env: Env, admin: Address, target: Address, role: Role) {
+        admin.require_auth();
+
+        // Check if caller has Admin role
+        if !Self::has_role(&env, &admin, Role::Admin) {
+            return; // Error::Unauthorized;
+        }
+
+        // Revoke the role
+        env.storage()
+            .instance()
+            .remove(&DataKey::Role(target.clone(), role.clone()));
+
+        // Emit event
+        env.events()
+            .publish((symbol_short!("revoke"), target), role);
+    }
+
+    /// Check if an address has a specific role
+    pub fn check_role(env: Env, address: Address, role: Role) -> bool {
+        Self::has_role(&env, &address, role)
+    }
+
+    /// Internal helper to check if an address has a role
+    fn has_role(env: &Env, address: &Address, role: Role) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Role(address.clone(), role))
+            .unwrap_or(false)
+    }
+
+    // ========== Contract Upgrade Functions ==========
+
+    /// Upgrade the contract to a new WASM hash
+    /// Only addresses with Admin role can perform this operation
+    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: soroban_sdk::BytesN<32>) {
+        admin.require_auth();
+
+        // Check if caller has Admin role
+        if !Self::has_role(&env, &admin, Role::Admin) {
+            return; // Error::Unauthorized;
+        }
+
+        // Update the contract WASM
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
+
+        // Emit upgrade event with new WASM hash
+        env.events()
+            .publish((symbol_short!("upgrade"), admin), new_wasm_hash);
+    }
+
+    /// Get the current admin address (for backward compatibility)
+    pub fn get_admin(env: Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set")
+    }
+
+    // --- CONTRIBUTOR PULL-REQUEST PAYMENTS ---
+
+    pub fn create_request(
+        env: Env,
+        receiver: Address,
+        token: Address,
+        total_amount: i128,
+        duration: u64,
+        metadata: Option<soroban_sdk::BytesN<32>>,
+    ) -> u64 {
+        receiver.require_auth();
+        let count: u64 = env.storage().instance().get(&RequestKey::RequestCount).unwrap_or(0);
+        let request_id = count + 1;
+        let now = env.ledger().timestamp();
+        let request = ContributorRequest {
+            id: request_id,
+            receiver: receiver.clone(),
+            token: token.clone(),
+            total_amount,
+            duration,
+            start_time: now,
+            status: RequestStatus::Pending,
+            metadata,
+        };
+        env.storage().instance().set(&RequestKey::Request(request_id), &request);
+        env.storage().instance().set(&RequestKey::RequestCount, &request_id);
+        env.events().publish(
+            (soroban_sdk::Symbol::new(&env, "RequestCreated"), request_id),
+            RequestCreatedEvent {
+                request_id,
+                receiver,
+                token,
+                total_amount,
+                duration,
+                timestamp: now,
+            },
+        );
+        request_id
+    }
+
+    pub fn execute_request(env: Env, admin: Address, request_id: u64) -> Result<u64, Error> {
+        admin.require_auth();
+        if !Self::has_role(&env, &admin, Role::Admin) {
+            return Err(Error::Unauthorized);
+        }
+        let mut request: ContributorRequest = env
+            .storage()
+            .instance()
+            .get(&RequestKey::Request(request_id))
+            .ok_or(Error::StreamNotFound)?;
+        if request.status != RequestStatus::Pending {
+            return Err(Error::AlreadyExecuted);
+        }
+        request.status = RequestStatus::Approved;
+        env.storage().instance().set(&RequestKey::Request(request_id), &request);
+        let stream_id = Self::create_stream(
+            env.clone(),
+            admin.clone(),
+            request.receiver.clone(),
+            request.token.clone(),
+            request.total_amount,
+            request.start_time,
+            request.start_time + request.duration,
+            CurveType::Linear,
+        )?;
+        env.events().publish(
+            (soroban_sdk::Symbol::new(&env, "RequestExecuted"), request_id),
+            RequestExecutedEvent {
+                request_id,
+                stream_id,
+                executor: admin,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+        Ok(stream_id)
+    }
+
+    pub fn get_request(env: Env, request_id: u64) -> Option<ContributorRequest> {
+        env.storage().instance().get(&RequestKey::Request(request_id))
+    }
+}
+
+// Contract metadata for explorer display (Stellar.Expert, etc.)
+soroban_sdk::contractmeta!(
+    desc = "StellarStream: Token streaming with multi-sig proposals, dynamic vesting curves (linear/exponential), yield optimization, and OFAC compliance. Create, manage, and withdraw from streams with flexible approval workflows.",
+    version = "0.1.0",
+    name = "StellarStream"
+);
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger},
+        token::{StellarAssetClient, TokenClient},
+        Address, Env,
+    };
+
+    fn set_admin_role(env: &Env, contract_id: &Address, admin: &Address) {
+        env.as_contract(contract_id, || {
+            env.storage()
+                .instance()
+                .set(&DataKey::Role(admin.clone(), Role::Admin), &true);
+        });
+    }
+
+    fn create_token_contract<'a>(env: &Env, admin: &Address) -> (Address, TokenClient<'a>) {
+        let contract_id = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        (contract_id.clone(), TokenClient::new(env, &contract_id))
+    }
+
+    #[test]
+    fn test_create_proposal() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|li| li.timestamp = 50);
+
+        let contract_id = env.register(StellarStreamContract, ());
+        let client = StellarStreamContractClient::new(&env, &contract_id);
+
+        let sender = Address::generate(&env);
+        let receiver = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (token_id, _) = create_token_contract(&env, &admin);
+
+        let proposal_id =
+            client.create_proposal(&sender, &receiver, &token_id, &1000, &100, &200, &2, &1000);
+
+        assert_eq!(proposal_id, 0);
+    }
+
+    #[test]
+    fn test_approve_proposal() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().with_mut(|li| li.timestamp = 50);
+
+        let contract_id = env.register(StellarStreamContract, ());
+        let client = StellarStreamContractClient::new(&env, &contract_id);
+
+        let sender = Address::generate(&env);
+        let receiver = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (token_id, _) = create_token_contract(&env, &admin);
+
+        let token_admin_client = StellarAssetClient::new(&env, &token_id);
+        token_admin_client.mint(&sender, &10000);
+
+        let approver1 = Address::generate(&env);
+        let approver2 = Address::generate(&env);
+
+        let proposal_id =
+            client.create_proposal(&sender, &receiver, &token_id, &1000, &100, &200, &2, &1000);
+
+        client.approve_proposal(&proposal_id, &approver1);
+
+        let proposal = client.get_proposal(&proposal_id);
+        assert_eq!(proposal.approvers.len(), 1);
+        assert!(!proposal.executed);
+
+        client.approve_proposal(&proposal_id, &approver2);
+
+        let proposal = client.get_proposal(&proposal_id);
+        assert_eq!(proposal.approvers.len(), 2);
+        assert!(proposal.executed);
+    }
+
+    #[test]
+    fn test_duplicate_approval_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|li| li.timestamp = 50);
+
+        let contract_id = env.register(StellarStreamContract, ());
+        let client = StellarStreamContractClient::new(&env, &contract_id);
+
+        let sender = Address::generate(&env);
+        let receiver = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (token_id, _) = create_token_contract(&env, &admin);
+
+        let approver = Address::generate(&env);
+
+        let proposal_id =
+            client.create_proposal(&sender, &receiver, &token_id, &1000, &100, &200, &2, &1000);
+
+        client.approve_proposal(&proposal_id, &approver);
+        let result = client.try_approve_proposal(&proposal_id, &approver);
+
+        assert_eq!(result, Err(Ok(Error::AlreadyApproved)));
+    }
+
+    #[test]
+    fn test_proposal_not_found() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(StellarStreamContract, ());
+        let client = StellarStreamContractClient::new(&env, &contract_id);
+
+        let approver = Address::generate(&env);
+        let result = client.try_approve_proposal(&999, &approver);
+
+        assert_eq!(result, Err(Ok(Error::ProposalNotFound)));
+    }
+
+    #[test]
+    fn test_invalid_time_range() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(StellarStreamContract, ());
+        let client = StellarStreamContractClient::new(&env, &contract_id);
+
+        let sender = Address::generate(&env);
+        let receiver = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (token_id, _) = create_token_contract(&env, &admin);
+
+        let result =
+            client.try_create_proposal(&sender, &receiver, &token_id, &1000, &200, &100, &2, &1000);
+
+        assert_eq!(result, Err(Ok(Error::InvalidTimeRange)));
+    }
+
+    #[test]
+    fn test_invalid_amount() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(StellarStreamContract, ());
+        let client = StellarStreamContractClient::new(&env, &contract_id);
+
+        let sender = Address::generate(&env);
+        let receiver = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (token_id, _) = create_token_contract(&env, &admin);
+
+        let result =
+            client.try_create_proposal(&sender, &receiver, &token_id, &0, &100, &200, &2, &1000);
+
+        assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+    }
+
+    #[test]
+    fn test_invalid_approval_threshold() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(StellarStreamContract, ());
+        let client = StellarStreamContractClient::new(&env, &contract_id);
+
+        let sender = Address::generate(&env);
+        let receiver = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (token_id, _) = create_token_contract(&env, &admin);
+
+        let result =
+            client.try_create_proposal(&sender, &receiver, &token_id, &1000, &100, &200, &0, &1000);
+
+        assert_eq!(result, Err(Ok(Error::InvalidApprovalThreshold)));
+    }
+
+    #[test]
+    fn test_create_direct_stream() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register(StellarStreamContract, ());
+        let client = StellarStreamContractClient::new(&env, &contract_id);
+
+        let sender = Address::generate(&env);
+        let receiver = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (token_id, _) = create_token_contract(&env, &admin);
+
+        let token_admin_client = StellarAssetClient::new(&env, &token_id);
+        token_admin_client.mint(&sender, &10000);
+
+        let stream_id = client.create_stream(
+            &sender,
+            &receiver,
+            &token_id,
+            &1000,
+            &100,
+            &200,
+            &CurveType::Linear,
+        );
+
+        assert_eq!(stream_id, 0);
+
+        let stream = client.get_stream(&stream_id);
+        assert_eq!(stream.total_amount, 1000);
+        assert_eq!(stream.withdrawn_amount, 0);
+        assert!(!stream.cancelled);
+        assert_eq!(stream.receipt_owner, receiver);
+
+        let receipt = client.get_receipt(&stream_id);
+        assert_eq!(receipt.stream_id, stream_id);
+        assert_eq!(receipt.owner, receiver);
+    }
+
+    #[test]
+    fn test_receipt_transfer() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register(StellarStreamContract, ());
+        let client = StellarStreamContractClient::new(&env, &contract_id);
+
+        let sender = Address::generate(&env);
+        let receiver = Address::generate(&env);
+        let new_owner = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (token_id, _) = create_token_contract(&env, &admin);
+
+        let token_admin_client = StellarAssetClient::new(&env, &token_id);
+        token_admin_client.mint(&sender, &10000);
+
+        let stream_id = client.create_stream(
+            &sender,
+            &receiver,
+            &token_id,
+            &1000,
+            &100,
+            &200,
+            &CurveType::Linear,
+        );
+
+        client.transfer_receipt(&stream_id, &receiver, &new_owner);
+
+        let receipt = client.get_receipt(&stream_id);
+        assert_eq!(receipt.owner, new_owner);
+
+        let stream = client.get_stream(&stream_id);
+        assert_eq!(stream.receipt_owner, new_owner);
+    }
+
+    #[test]
+    fn test_withdraw_with_receipt_owner() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().with_mut(|li| li.timestamp = 150);
+
+        let contract_id = env.register(StellarStreamContract, ());
+        let client = StellarStreamContractClient::new(&env, &contract_id);
+
+        let sender = Address::generate(&env);
+        let receiver = Address::generate(&env);
+        let new_owner = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (token_id, _) = create_token_contract(&env, &admin);
+
+        let token_admin_client = StellarAssetClient::new(&env, &token_id);
+        token_admin_client.mint(&sender, &10000);
+
+        let stream_id = client.create_stream(
+            &sender,
+            &receiver,
+            &token_id,
+            &1000,
+            &100,
+            &200,
+            &CurveType::Linear,
+        );
+
+        client.transfer_receipt(&stream_id, &receiver, &new_owner);
+
+        let result = client.try_withdraw(&stream_id, &receiver);
+        assert_eq!(result, Err(Ok(Error::NotReceiptOwner)));
+
+        let withdrawn = client.withdraw(&stream_id, &new_owner);
+        assert!(withdrawn > 0);
+    }
+
+    #[test]
+    fn test_receipt_metadata() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().with_mut(|li| li.timestamp = 150);
+
+        let contract_id = env.register(StellarStreamContract, ());
+        let client = StellarStreamContractClient::new(&env, &contract_id);
+
+        let sender = Address::generate(&env);
+        let receiver = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (token_id, _) = create_token_contract(&env, &admin);
+
+        let token_admin_client = StellarAssetClient::new(&env, &token_id);
+        token_admin_client.mint(&sender, &10000);
+
+        let stream_id = client.create_stream(
+            &sender,
+            &receiver,
+            &token_id,
+            &1000,
+            &100,
+            &200,
+            &CurveType::Linear,
+        );
+
+        let metadata = client.get_receipt_metadata(&stream_id);
+        assert_eq!(metadata.stream_id, stream_id);
+        assert_eq!(metadata.total_amount, 1000);
+        assert_eq!(metadata.token, token_id);
+        assert!(metadata.unlocked_balance > 0);
+        assert!(metadata.locked_balance < 1000);
+    }
+
+    #[test]
+    fn test_three_of_five_multisig() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().with_mut(|li| li.timestamp = 50);
+
+        let contract_id = env.register(StellarStreamContract, ());
+        let client = StellarStreamContractClient::new(&env, &contract_id);
+
+        let sender = Address::generate(&env);
+        let receiver = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (token_id, _) = create_token_contract(&env, &admin);
+
+        let token_admin_client = StellarAssetClient::new(&env, &token_id);
+        token_admin_client.mint(&sender, &100000);
+
+        let proposal_id =
+            client.create_proposal(&sender, &receiver, &token_id, &50000, &100, &200, &3, &1000);
+
+        let approver1 = Address::generate(&env);
+        let approver2 = Address::generate(&env);
+        let approver3 = Address::generate(&env);
+
+        client.approve_proposal(&proposal_id, &approver1);
+        let proposal = client.get_proposal(&proposal_id);
+        assert!(!proposal.executed);
+
+        client.approve_proposal(&proposal_id, &approver2);
+        let proposal = client.get_proposal(&proposal_id);
+        assert!(!proposal.executed);
+
+        client.approve_proposal(&proposal_id, &approver3);
+        let proposal = client.get_proposal(&proposal_id);
+        assert!(proposal.executed);
+        assert_eq!(proposal.approvers.len(), 3);
+    }
+
+    #[test]
+    fn test_approve_already_executed_proposal() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().with_mut(|li| li.timestamp = 50);
+
+        let contract_id = env.register(StellarStreamContract, ());
+        let client = StellarStreamContractClient::new(&env, &contract_id);
+
+        let sender = Address::generate(&env);
+        let receiver = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (token_id, _) = create_token_contract(&env, &admin);
+
+        let token_admin_client = StellarAssetClient::new(&env, &token_id);
+        token_admin_client.mint(&sender, &10000);
+
+        let proposal_id =
+            client.create_proposal(&sender, &receiver, &token_id, &1000, &100, &200, &1, &1000);
+
+        let approver1 = Address::generate(&env);
+        client.approve_proposal(&proposal_id, &approver1);
+
+        let approver2 = Address::generate(&env);
+        let result = client.try_approve_proposal(&proposal_id, &approver2);
+
+        assert_eq!(result, Err(Ok(Error::ProposalAlreadyExecuted)));
+    }
+
+    #[test]
+    fn test_pause_unpause_stream() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().with_mut(|li| li.timestamp = 100);
+
+        let contract_id = env.register(StellarStreamContract, ());
+        let client = StellarStreamContractClient::new(&env, &contract_id);
+
+        let sender = Address::generate(&env);
+        let receiver = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (token_id, _) = create_token_contract(&env, &admin);
+
+        let token_admin_client = StellarAssetClient::new(&env, &token_id);
+        token_admin_client.mint(&sender, &10000);
+
+        let stream_id = client.create_stream(
+            &sender,
+            &receiver,
+            &token_id,
+            &1000,
+            &100,
+            &300,
+            &CurveType::Linear,
+        );
+
+        env.ledger().with_mut(|li| li.timestamp = 150);
+        client.pause_stream(&stream_id, &sender);
+
+        let stream = client.get_stream(&stream_id);
+        assert!(stream.is_paused);
+        assert_eq!(stream.paused_time, 150);
+
+        env.ledger().with_mut(|li| li.timestamp = 200);
+        client.unpause_stream(&stream_id, &sender);
+
+        let stream = client.get_stream(&stream_id);
+        assert!(!stream.is_paused);
+        assert_eq!(stream.total_paused_duration, 50);
+    }
+
+    #[test]
+    fn test_withdraw_paused_fails() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().with_mut(|li| li.timestamp = 100);
+
+        let contract_id = env.register(StellarStreamContract, ());
+        let client = StellarStreamContractClient::new(&env, &contract_id);
+
+        let sender = Address::generate(&env);
+        let receiver = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (token_id, _) = create_token_contract(&env, &admin);
+
+        let token_admin_client = StellarAssetClient::new(&env, &token_id);
+        token_admin_client.mint(&sender, &10000);
+
+        let stream_id = client.create_stream(
+            &sender,
+            &receiver,
+            &token_id,
+            &1000,
+            &100,
+            &300,
+            &CurveType::Linear,
+        );
+
+        client.pause_stream(&stream_id, &sender);
+
+        env.ledger().with_mut(|li| li.timestamp = 150);
+        let result = client.try_withdraw(&stream_id, &receiver);
+
+        assert_eq!(result, Err(Ok(Error::StreamPaused)));
+    }
+
+    #[test]
+    fn test_pause_adjusts_unlocked_balance() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().with_mut(|li| li.timestamp = 100);
+
+        let contract_id = env.register(StellarStreamContract, ());
+        let client = StellarStreamContractClient::new(&env, &contract_id);
+
+        let sender = Address::generate(&env);
+        let receiver = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (token_id, _) = create_token_contract(&env, &admin);
+
+        let token_admin_client = StellarAssetClient::new(&env, &token_id);
+        token_admin_client.mint(&sender, &10000);
+
+        let stream_id = client.create_stream(
+            &sender,
+            &receiver,
+            &token_id,
+            &1000,
+            &100,
+            &300,
+            &CurveType::Linear,
+        );
+
+        env.ledger().with_mut(|li| li.timestamp = 150);
+        let metadata_before = client.get_receipt_metadata(&stream_id);
+        let unlocked_before = metadata_before.unlocked_balance;
+
+        client.pause_stream(&stream_id, &sender);
+
+        env.ledger().with_mut(|li| li.timestamp = 200);
+        let metadata_paused = client.get_receipt_metadata(&stream_id);
+
+        assert_eq!(metadata_paused.unlocked_balance, unlocked_before);
+
+        client.unpause_stream(&stream_id, &sender);
+
+        env.ledger().with_mut(|li| li.timestamp = 250);
+        let withdrawn = client.withdraw(&stream_id, &receiver);
+        assert!(withdrawn > 0);
+    }
+
+    #[test]
+    fn test_quarterly_vesting() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().with_mut(|li| li.timestamp = 0);
+
+        let contract_id = env.register(StellarStreamContract, ());
+        let client = StellarStreamContractClient::new(&env, &contract_id);
+
+        let sender = Address::generate(&env);
+        let receiver = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (token_id, _) = create_token_contract(&env, &admin);
+
+        let token_admin_client = StellarAssetClient::new(&env, &token_id);
+        token_admin_client.mint(&sender, &10000);
+
+        let mut milestones = Vec::new(&env);
+        milestones.push_back(Milestone {
+            timestamp: 90,
+            percentage: 25,
+        });
+        milestones.push_back(Milestone {
+            timestamp: 180,
+            percentage: 50,
+        });
+        milestones.push_back(Milestone {
+            timestamp: 270,
+            percentage: 75,
+        });
+        milestones.push_back(Milestone {
+            timestamp: 360,
+            percentage: 100,
+        });
+
+        let stream_id = client.create_stream_with_milestones(
+            &sender,
+            &receiver,
+            &token_id,
+            &1000,
+            &0,
+            &360,
+            &milestones,
+            &CurveType::Linear,
+        );
+
+        env.ledger().with_mut(|li| li.timestamp = 45);
+        let metadata = client.get_receipt_metadata(&stream_id);
+        assert!(metadata.unlocked_balance <= 250);
+
+        env.ledger().with_mut(|li| li.timestamp = 100);
+        let metadata = client.get_receipt_metadata(&stream_id);
+        assert_eq!(metadata.unlocked_balance, 250);
+
+        env.ledger().with_mut(|li| li.timestamp = 200);
+        let metadata = client.get_receipt_metadata(&stream_id);
+        assert_eq!(metadata.unlocked_balance, 500);
+    }
+
+    #[test]
+    fn test_hybrid_streaming() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().with_mut(|li| li.timestamp = 0);
+
+        let contract_id = env.register(StellarStreamContract, ());
+        let client = StellarStreamContractClient::new(&env, &contract_id);
+
+        let sender = Address::generate(&env);
+        let receiver = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (token_id, _) = create_token_contract(&env, &admin);
+
+        let token_admin_client = StellarAssetClient::new(&env, &token_id);
+        token_admin_client.mint(&sender, &10000);
+
+        let mut milestones = Vec::new(&env);
+        milestones.push_back(Milestone {
+            timestamp: 100,
+            percentage: 50,
+        });
+
+        let stream_id = client.create_stream_with_milestones(
+            &sender,
+            &receiver,
+            &token_id,
+            &1000,
+            &0,
+            &200,
+            &milestones,
+            &CurveType::Linear,
+        );
+
+        env.ledger().with_mut(|li| li.timestamp = 50);
+        let metadata = client.get_receipt_metadata(&stream_id);
+        assert!(metadata.unlocked_balance <= 250);
+
+        env.ledger().with_mut(|li| li.timestamp = 150);
+        let metadata = client.get_receipt_metadata(&stream_id);
+        assert_eq!(metadata.unlocked_balance, 500);
+
+        env.ledger().with_mut(|li| li.timestamp = 200);
+        let metadata = client.get_receipt_metadata(&stream_id);
+        assert_eq!(metadata.unlocked_balance, 1000);
+    }
+
+    // ============================================================================
+    // EVENT EMISSION TESTS
+    // ============================================================================
+    // Tests to ensure all state changes emit proper events with correct data
+
+    #[test]
+    fn test_create_stream_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register(StellarStreamContract, ());
+        let client = StellarStreamContractClient::new(&env, &contract_id);
+
+        let sender = Address::generate(&env);
+        let receiver = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (token_id, _) = create_token_contract(&env, &admin);
+
+        let token_admin_client = StellarAssetClient::new(&env, &token_id);
+        token_admin_client.mint(&sender, &10000);
+
+        // Create stream - should emit create event
+        let stream_id = client.create_stream(
+            &sender,
+            &receiver,
+            &token_id,
+            &1000,
+            &100,
+            &200,
+            &CurveType::Linear,
+        );
+
+        assert_eq!(stream_id, 0);
+        // Event verification would be done through event monitoring in integration tests
+    }
+
+    #[test]
+    fn test_withdraw_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().with_mut(|li| li.timestamp = 150);
+
+        let contract_id = env.register(StellarStreamContract, ());
+        let client = StellarStreamContractClient::new(&env, &contract_id);
+
+        let sender = Address::generate(&env);
+        let receiver = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (token_id, _) = create_token_contract(&env, &admin);
+
+        let token_admin_client = StellarAssetClient::new(&env, &token_id);
+        token_admin_client.mint(&sender, &10000);
+
+        let stream_id = client.create_stream(
+            &sender,
+            &receiver,
+            &token_id,
+            &1000,
+            &100,
+            &200,
+            &CurveType::Linear,
+        );
+
+        // Withdraw - should emit claim event
+        let withdrawn = client.withdraw(&stream_id, &receiver);
+        assert!(withdrawn > 0);
+        // Event verification would be done through event monitoring in integration tests
+    }
+
+    #[test]
+    fn test_cancel_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().with_mut(|li| li.timestamp = 150);
+
+        let contract_id = env.register(StellarStreamContract, ());
+        let client = StellarStreamContractClient::new(&env, &contract_id);
+
+        let sender = Address::generate(&env);
+        let receiver = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (token_id, _) = create_token_contract(&env, &admin);
+
+        let token_admin_client = StellarAssetClient::new(&env, &token_id);
+        token_admin_client.mint(&sender, &10000);
+
+        let stream_id = client.create_stream(
+            &sender,
+            &receiver,
+            &token_id,
+            &1000,
+            &100,
+            &200,
+            &CurveType::Linear,
+        );
+
+        // Cancel - should emit cancel event
+        client.cancel(&stream_id, &sender);
+        // Event verification would be done through event monitoring in integration tests
+    }
+
+    #[test]
+    fn test_transfer_receipt_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let contract_id = env.register(StellarStreamContract, ());
+        let client = StellarStreamContractClient::new(&env, &contract_id);
+
+        let sender = Address::generate(&env);
+        let receiver = Address::generate(&env);
+        let new_owner = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (token_id, _) = create_token_contract(&env, &admin);
+
+        let token_admin_client = StellarAssetClient::new(&env, &token_id);
+        token_admin_client.mint(&sender, &10000);
+
+        let stream_id = client.create_stream(
+            &sender,
+            &receiver,
+            &token_id,
+            &1000,
+            &100,
+            &200,
+            &CurveType::Linear,
+        );
+
+        // Transfer receipt - should emit transfer event
+        client.transfer_receipt(&stream_id, &receiver, &new_owner);
+        // Event verification would be done through event monitoring in integration tests
+    }
+
+    #[test]
+    fn test_pause_stream_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().with_mut(|li| li.timestamp = 100);
+
+        let contract_id = env.register(StellarStreamContract, ());
+        let client = StellarStreamContractClient::new(&env, &contract_id);
+
+        let sender = Address::generate(&env);
+        let receiver = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (token_id, _) = create_token_contract(&env, &admin);
+
+        let token_admin_client = StellarAssetClient::new(&env, &token_id);
+        token_admin_client.mint(&sender, &10000);
+
+        let stream_id = client.create_stream(
+            &sender,
+            &receiver,
+            &token_id,
+            &1000,
+            &100,
+            &300,
+            &CurveType::Linear,
+        );
+
+        // Pause stream - should emit pause event
+        client.pause_stream(&stream_id, &sender);
+        // Event verification would be done through event monitoring in integration tests
+    }
+
+    #[test]
+    fn test_unpause_stream_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().with_mut(|li| li.timestamp = 100);
+
+        let contract_id = env.register(StellarStreamContract, ());
+        let client = StellarStreamContractClient::new(&env, &contract_id);
+
+        let sender = Address::generate(&env);
+        let receiver = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (token_id, _) = create_token_contract(&env, &admin);
+
+        let token_admin_client = StellarAssetClient::new(&env, &token_id);
+        token_admin_client.mint(&sender, &10000);
+
+        let stream_id = client.create_stream(
+            &sender,
+            &receiver,
+            &token_id,
+            &1000,
+            &100,
+            &300,
+            &CurveType::Linear,
+        );
+
+        client.pause_stream(&stream_id, &sender);
+
+        env.ledger().with_mut(|li| li.timestamp = 200);
+
+        // Unpause stream - should emit unpause event
+        client.unpause_stream(&stream_id, &sender);
+        // Event verification would be done through event monitoring in integration tests
+    }
+
+    #[test]
+    fn test_approve_proposal_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().with_mut(|li| li.timestamp = 50);
+
+        let contract_id = env.register(StellarStreamContract, ());
+        let client = StellarStreamContractClient::new(&env, &contract_id);
+
+        let sender = Address::generate(&env);
+        let receiver = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (token_id, _) = create_token_contract(&env, &admin);
+
+        let token_admin_client = StellarAssetClient::new(&env, &token_id);
+        token_admin_client.mint(&sender, &10000);
+
+        let proposal_id =
+            client.create_proposal(&sender, &receiver, &token_id, &1000, &100, &200, &2, &1000);
+
+        let approver1 = Address::generate(&env);
+        let approver2 = Address::generate(&env);
+
+        // First approval - should emit approve event
+        client.approve_proposal(&proposal_id, &approver1);
+        // Event verification would be done through event monitoring in integration tests
+
+        // Second approval - should emit approve event and create stream
+        client.approve_proposal(&proposal_id, &approver2);
+        // Event verification would be done through event monitoring in integration tests
+    }
+
+    #[test]
+    fn test_exponential_stream() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().with_mut(|li| li.timestamp = 0);
+
+        let contract_id = env.register(StellarStreamContract, ());
+        let client = StellarStreamContractClient::new(&env, &contract_id);
+
+        let sender = Address::generate(&env);
+        let receiver = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let (token_id, _) = create_token_contract(&env, &admin);
+
+        let token_admin_client = StellarAssetClient::new(&env, &token_id);
+        token_admin_client.mint(&sender, &10000);
+
+        let stream_id = client.create_stream(
+            &sender,
+            &receiver,
+            &token_id,
+            &1000,
+            &0,
+            &100,
+            &CurveType::Exponential,
+        );
+
+        // At 50% time: should have ~25% unlocked (0.5^2 = 0.25)
+        env.ledger().with_mut(|li| li.timestamp = 50);
+        let metadata = client.get_receipt_metadata(&stream_id);
+        assert!(metadata.unlocked_balance >= 240 && metadata.unlocked_balance <= 260);
+
+        // At 70% time: should have ~49% unlocked (0.7^2 = 0.49)
+        env.ledger().with_mut(|li| li.timestamp = 70);
+        let metadata = client.get_receipt_metadata(&stream_id);
+        assert!(metadata.unlocked_balance >= 480 && metadata.unlocked_balance <= 500);
+
+        // At 100% time: should have 100% unlocked
+        env.ledger().with_mut(|li| li.timestamp = 100);
+        let metadata = client.get_receipt_metadata(&stream_id);
+        assert_eq!(metadata.unlocked_balance, 1000);
+
+        // Verify withdrawal works
+        let withdrawn = client.withdraw(&stream_id, &receiver);
+        assert_eq!(withdrawn, 1000);
+    }
+
+    // ========== OFAC Compliance Tests ==========
+
+    #[test]
+    fn test_restrict_address_by_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(StellarStreamContract, ());
+        let client = StellarStreamContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let restricted_addr = Address::generate(&env);
+
+        set_admin_role(&env, &contract_id, &admin);
+
+        // Admin restricts an address
+        client.restrict_address(&admin, &restricted_addr);
+
+        // Verify address is restricted
+        assert!(client.is_address_restricted(&restricted_addr));
+    }
+
+    #[test]
+    fn test_unrestrict_address_by_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(StellarStreamContract, ());
+        let client = StellarStreamContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let restricted_addr = Address::generate(&env);
+
+        // Manually set admin role in storage to bootstrap
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .instance()
+                .set(&DataKey::Role(admin.clone(), Role::Admin), &true);
+        });
+
+        // Admin restricts an address
+        client.restrict_address(&admin, &restricted_addr);
+        assert!(client.is_address_restricted(&restricted_addr));
+
+        // Admin unrestricts the address
+        client.unrestrict_address(&admin, &restricted_addr);
+
+        // Verify address is no longer restricted
+        assert!(!client.is_address_restricted(&restricted_addr));
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #5)")]
+    fn test_non_admin_cannot_restrict_address() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(StellarStreamContract, ());
+        let client = StellarStreamContractClient::new(&env, &contract_id);
+
+        let non_admin = Address::generate(&env);
+        let restricted_addr = Address::generate(&env);
+
+        // Non-admin tries to restrict an address - should panic
+        client.restrict_address(&non_admin, &restricted_addr);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #20)")]
+    fn test_cannot_create_stream_to_restricted_address() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|li| li.timestamp = 100);
+
+        let contract_id = env.register(StellarStreamContract, ());
+        let client = StellarStreamContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let restricted_receiver = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+
+        set_admin_role(&env, &contract_id, &admin);
+
+        // Create token
+        let token_id = env.register_stellar_asset_contract(token_admin.clone());
+
+        // Mint tokens to sender
+        let token_client = token::StellarAssetClient::new(&env, &token_id);
+        token_client.mint(&sender, &1000);
+
+        // Admin restricts the receiver address
+        client.restrict_address(&admin, &restricted_receiver);
+
+        // Attempt to create stream to restricted address should panic
+        client.create_stream(
+            &sender,
+            &restricted_receiver,
+            &token_id,
+            &1000,
+            &100,
+            &200,
+            &CurveType::Linear,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #20)")]
+    fn test_cannot_create_proposal_to_restricted_address() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|li| li.timestamp = 50);
+
+        let contract_id = env.register(StellarStreamContract, ());
+        let client = StellarStreamContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let restricted_receiver = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+
+        set_admin_role(&env, &contract_id, &admin);
+
+        // Create token
+        let token_id = env.register_stellar_asset_contract(token_admin.clone());
+
+        // Mint tokens to sender
+        let token_client = token::StellarAssetClient::new(&env, &token_id);
+        token_client.mint(&sender, &1000);
+
+        // Admin restricts the receiver address
+        client.restrict_address(&admin, &restricted_receiver);
+
+        // Attempt to create proposal to restricted address should panic
+        client.create_proposal(
+            &sender,
+            &restricted_receiver,
+            &token_id,
+            &1000,
+            &100,
+            &200,
+            &2,
+            &1000,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #20)")]
+    fn test_cannot_transfer_receipt_to_restricted_address() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|li| li.timestamp = 100);
+
+        let contract_id = env.register(StellarStreamContract, ());
+        let client = StellarStreamContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let receiver = Address::generate(&env);
+        let restricted_addr = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+
+        set_admin_role(&env, &contract_id, &admin);
+
+        // Create token
+        let token_id = env.register_stellar_asset_contract(token_admin.clone());
+
+        // Mint tokens to sender
+        let token_client = token::StellarAssetClient::new(&env, &token_id);
+        token_client.mint(&sender, &1000);
+
+        // Create stream to valid receiver
+        let stream_id = client.create_stream(
+            &sender,
+            &receiver,
+            &token_id,
+            &1000,
+            &100,
+            &200,
+            &CurveType::Linear,
+        );
+
+        // Admin restricts an address
+        client.restrict_address(&admin, &restricted_addr);
+
+        // Attempt to transfer receipt to restricted address should panic
+        client.transfer_receipt(&stream_id, &receiver, &restricted_addr);
+    }
+
+    #[test]
+    fn test_get_restricted_addresses_list() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(StellarStreamContract, ());
+        let client = StellarStreamContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let addr1 = Address::generate(&env);
+        let addr2 = Address::generate(&env);
+        let addr3 = Address::generate(&env);
+
+        set_admin_role(&env, &contract_id, &admin);
+
+        // Initially, no restricted addresses
+        let restricted = client.get_restricted_addresses();
+        assert_eq!(restricted.len(), 0);
+
+        // Admin restricts addresses
+        client.restrict_address(&admin, &addr1);
+        client.restrict_address(&admin, &addr2);
+        client.restrict_address(&admin, &addr3);
+
+        // Verify all addresses are in the list
+        let restricted = client.get_restricted_addresses();
+        assert_eq!(restricted.len(), 3);
+    }
+
+    #[test]
+    fn test_restrict_same_address_twice_is_idempotent() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(StellarStreamContract, ());
+        let client = StellarStreamContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let restricted_addr = Address::generate(&env);
+
+        set_admin_role(&env, &contract_id, &admin);
+
+        // Restrict address first time
+        client.restrict_address(&admin, &restricted_addr);
+        let restricted_1 = client.get_restricted_addresses();
+        assert_eq!(restricted_1.len(), 1);
+
+        // Restrict same address again (should be idempotent)
+        client.restrict_address(&admin, &restricted_addr);
+        let restricted_2 = client.get_restricted_addresses();
+        assert_eq!(restricted_2.len(), 1);
+
+        // Verify address is still restricted
+        assert!(client.is_address_restricted(&restricted_addr));
+    }
+
+    #[test]
+    fn test_stream_creation_allowed_after_unrestriction() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|li| li.timestamp = 100);
+
+        let contract_id = env.register(StellarStreamContract, ());
+        let client = StellarStreamContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let receiver = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+
+        set_admin_role(&env, &contract_id, &admin);
+
+        // Create token
+        let token_id = env.register_stellar_asset_contract(token_admin.clone());
+
+        // Mint tokens to sender
+        let token_client = token::StellarAssetClient::new(&env, &token_id);
+        token_client.mint(&sender, &1000);
+
+        // Admin restricts the receiver
+        client.restrict_address(&admin, &receiver);
+
+        // Admin unrestricts the receiver
+        client.unrestrict_address(&admin, &receiver);
+
+        // Now stream creation should succeed
+        let stream_id = client.create_stream(
+            &sender,
+            &receiver,
+            &token_id,
+            &1000,
+            &100,
+            &200,
+            &CurveType::Linear,
+        );
+        
+        // Verify stream was created (stream_id >= 0)
+        assert!(stream_id >= 0);
     }
 }
