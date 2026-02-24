@@ -1,6 +1,7 @@
 "use client";
 
 import TokenFlowBadge from "@/components/token-flow-badge";
+import EnhancedStreamSummaryCard from "@/components/enhanced-stream-summary-card";
 
 export default function TokenFlowBadgeDemoPage() {
   return (
@@ -112,7 +113,54 @@ export default function TokenFlowBadgeDemoPage() {
           </div>
         </div>
 
-        {/* Design Specifications */}
+        {/* Integration Examples */}
+        <div className="bg-white/5 backdrop-blur-sm rounded-2xl border border-white/10 p-8 mb-8">
+          <h2 className="text-2xl font-semibold text-white mb-6">Integration Examples</h2>
+          
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+            {/* Incoming Stream Card */}
+            <div>
+              <h3 className="text-lg font-medium text-cyan-400 mb-4">Incoming Stream Card</h3>
+              <EnhancedStreamSummaryCard
+                direction="incoming"
+                sender={{
+                  address: "GCKFBEIYTKP7WM6AMMBN3VZ7TMX5R7QZAPRNYXAX",
+                  label: "DeFi Protocol"
+                }}
+                receiver={{
+                  address: "GDXLKEY2TR2BOZYY7YKMZBRH4HQCKQYCVKFWYGME",
+                  label: "Your Wallet"
+                }}
+                tokenSymbol="USDC"
+                amountStreamed={1250.75}
+                totalAmount={5000}
+                startTime={new Date(Date.now() - 86400000 * 2)}
+                endTime={new Date(Date.now() + 86400000 * 8)}
+              />
+            </div>
+
+            {/* Outgoing Stream Card */}
+            <div>
+              <h3 className="text-lg font-medium text-violet-400 mb-4">Outgoing Stream Card</h3>
+              <EnhancedStreamSummaryCard
+                direction="outgoing"
+                sender={{
+                  address: "GDXLKEY2TR2BOZYY7YKMZBRH4HQCKQYCVKFWYGME",
+                  label: "Your Wallet"
+                }}
+                receiver={{
+                  address: "GBNZILSTVQZ4R7LYKAQF3HZPNE2EGLKW27JRIMLF",
+                  label: "Savings Account"
+                }}
+                tokenSymbol="XLM"
+                amountStreamed={500.25}
+                totalAmount={2000}
+                startTime={new Date(Date.now() - 86400000 * 1)}
+                endTime={new Date(Date.now() + 86400000 * 14)}
+              />
+            </div>
+          </div>
+        </div>
         <div className="bg-white/5 backdrop-blur-sm rounded-2xl border border-white/10 p-8">
           <h2 className="text-2xl font-semibold text-white mb-6">Design Specifications</h2>
           
