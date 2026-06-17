@@ -1,8 +1,6 @@
 #![cfg(test)]
 extern crate std;
 
-use std::panic::AssertUnwindSafe;
-
 use soroban_sdk::{
     testutils::{Address as _, Ledger as _},
     token::{Client as TokenClient, StellarAssetClient},

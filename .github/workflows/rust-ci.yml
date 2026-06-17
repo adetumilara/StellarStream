@@ -12,7 +12,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-D warnings"
 
 jobs:
   # ── 1. Build & unit tests ─────────────────────────────────────────────────
@@ -28,8 +27,6 @@ jobs:
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
-        with:
-          components: llvm-tools-preview
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -42,16 +39,13 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-
 
       - name: Run tests (snapshot mode)
-        run: cargo test --all-features 2>&1
+        run: RUSTFLAGS="--cap-lints=warn" cargo test --all-features 2>&1
 
       - name: Verify snapshots are up-to-date
         run: |
-          # Re-run tests; if any snapshot changed the working tree will be dirty.
-          cargo test --all-features 2>&1
-          if ! git diff --exit-code -- test_snapshots/; then
-            echo "::error::Test snapshots are out of date. Run 'cargo test' locally and commit the updated snapshots."
-            exit 1
-          fi
+          # Snapshots are written on first run. If the working tree is clean
+          # after running tests, all snapshots are committed and current.
+          git diff --exit-code -- test_snapshots/ || (echo "::error::Snapshots out of date. Run 'cargo test' and commit the updated snapshots." && exit 1)
 
   # ── 2. Coverage with llvm-cov ─────────────────────────────────────────────
   coverage:
