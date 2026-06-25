@@ -28102,6 +28102,7 @@ export namespace Prisma {
     createdAt: Date | null
     completedAt: Date | null
     ledger: number | null
+    batchId: string | null
   }
 
   export type DisbursementMaxAggregateOutputType = {
@@ -28116,6 +28117,7 @@ export namespace Prisma {
     createdAt: Date | null
     completedAt: Date | null
     ledger: number | null
+    batchId: string | null
   }
 
   export type DisbursementCountAggregateOutputType = {
@@ -28130,6 +28132,7 @@ export namespace Prisma {
     createdAt: number
     completedAt: number
     ledger: number
+    batchId: number
     _all: number
   }
 
@@ -28156,6 +28159,7 @@ export namespace Prisma {
     createdAt?: true
     completedAt?: true
     ledger?: true
+    batchId?: true
   }
 
   export type DisbursementMaxAggregateInputType = {
@@ -28170,6 +28174,7 @@ export namespace Prisma {
     createdAt?: true
     completedAt?: true
     ledger?: true
+    batchId?: true
   }
 
   export type DisbursementCountAggregateInputType = {
@@ -28184,6 +28189,7 @@ export namespace Prisma {
     createdAt?: true
     completedAt?: true
     ledger?: true
+    batchId?: true
     _all?: true
   }
 
@@ -28285,6 +28291,7 @@ export namespace Prisma {
     createdAt: Date
     completedAt: Date | null
     ledger: number
+    batchId: string | null
     _count: DisbursementCountAggregateOutputType | null
     _avg: DisbursementAvgAggregateOutputType | null
     _sum: DisbursementSumAggregateOutputType | null
@@ -28318,6 +28325,7 @@ export namespace Prisma {
     createdAt?: boolean
     completedAt?: boolean
     ledger?: boolean
+    batchId?: boolean
   }, ExtArgs["result"]["disbursement"]>
 
   export type DisbursementSelectCreateManyAndReturn<ExtArgs extends $Extensions.InternalArgs = $Extensions.DefaultArgs> = $Extensions.GetSelect<{
@@ -28332,6 +28340,7 @@ export namespace Prisma {
     createdAt?: boolean
     completedAt?: boolean
     ledger?: boolean
+    batchId?: boolean
   }, ExtArgs["result"]["disbursement"]>
 
   export type DisbursementSelectScalar = {
@@ -28346,6 +28355,7 @@ export namespace Prisma {
     createdAt?: boolean
     completedAt?: boolean
     ledger?: boolean
+    batchId?: boolean
   }
 
 
@@ -28364,6 +28374,7 @@ export namespace Prisma {
       createdAt: Date
       completedAt: Date | null
       ledger: number
+      batchId: string | null
     }, ExtArgs["result"]["disbursement"]>
     composites: {}
   }
@@ -28768,6 +28779,7 @@ export namespace Prisma {
     readonly createdAt: FieldRef<"Disbursement", 'DateTime'>
     readonly completedAt: FieldRef<"Disbursement", 'DateTime'>
     readonly ledger: FieldRef<"Disbursement", 'Int'>
+    readonly batchId: FieldRef<"Disbursement", 'String'>
   }
     
 
@@ -40376,7 +40388,8 @@ export namespace Prisma {
     status: 'status',
     createdAt: 'createdAt',
     completedAt: 'completedAt',
-    ledger: 'ledger'
+    ledger: 'ledger',
+    batchId: 'batchId'
   };
 
   export type DisbursementScalarFieldEnum = (typeof DisbursementScalarFieldEnum)[keyof typeof DisbursementScalarFieldEnum]
@@ -42703,6 +42716,7 @@ export namespace Prisma {
     createdAt?: DateTimeFilter<"Disbursement"> | Date | string
     completedAt?: DateTimeNullableFilter<"Disbursement"> | Date | string | null
     ledger?: IntFilter<"Disbursement"> | number
+    batchId?: StringNullableFilter<"Disbursement"> | string | null
   }
 
   export type DisbursementOrderByWithRelationInput = {
@@ -42717,6 +42731,7 @@ export namespace Prisma {
     createdAt?: SortOrder
     completedAt?: SortOrderInput | SortOrder
     ledger?: SortOrder
+    batchId?: SortOrderInput | SortOrder
   }
 
   export type DisbursementWhereUniqueInput = Prisma.AtLeast<{
@@ -42734,6 +42749,7 @@ export namespace Prisma {
     createdAt?: DateTimeFilter<"Disbursement"> | Date | string
     completedAt?: DateTimeNullableFilter<"Disbursement"> | Date | string | null
     ledger?: IntFilter<"Disbursement"> | number
+    batchId?: StringNullableFilter<"Disbursement"> | string | null
   }, "id" | "txHash">
 
   export type DisbursementOrderByWithAggregationInput = {
@@ -42748,6 +42764,7 @@ export namespace Prisma {
     createdAt?: SortOrder
     completedAt?: SortOrderInput | SortOrder
     ledger?: SortOrder
+    batchId?: SortOrderInput | SortOrder
     _count?: DisbursementCountOrderByAggregateInput
     _avg?: DisbursementAvgOrderByAggregateInput
     _max?: DisbursementMaxOrderByAggregateInput
@@ -42770,6 +42787,7 @@ export namespace Prisma {
     createdAt?: DateTimeWithAggregatesFilter<"Disbursement"> | Date | string
     completedAt?: DateTimeNullableWithAggregatesFilter<"Disbursement"> | Date | string | null
     ledger?: IntWithAggregatesFilter<"Disbursement"> | number
+    batchId?: StringNullableWithAggregatesFilter<"Disbursement"> | string | null
   }
 
   export type AssetMappingWhereInput = {
@@ -45924,6 +45942,7 @@ export namespace Prisma {
     createdAt?: Date | string
     completedAt?: Date | string | null
     ledger: number
+    batchId?: string | null
   }
 
   export type DisbursementUncheckedCreateInput = {
@@ -45938,6 +45957,7 @@ export namespace Prisma {
     createdAt?: Date | string
     completedAt?: Date | string | null
     ledger: number
+    batchId?: string | null
   }
 
   export type DisbursementUpdateInput = {
@@ -45952,6 +45972,7 @@ export namespace Prisma {
     createdAt?: DateTimeFieldUpdateOperationsInput | Date | string
     completedAt?: NullableDateTimeFieldUpdateOperationsInput | Date | string | null
     ledger?: IntFieldUpdateOperationsInput | number
+    batchId?: NullableStringFieldUpdateOperationsInput | string | null
   }
 
   export type DisbursementUncheckedUpdateInput = {
@@ -45966,6 +45987,7 @@ export namespace Prisma {
     createdAt?: DateTimeFieldUpdateOperationsInput | Date | string
     completedAt?: NullableDateTimeFieldUpdateOperationsInput | Date | string | null
     ledger?: IntFieldUpdateOperationsInput | number
+    batchId?: NullableStringFieldUpdateOperationsInput | string | null
   }
 
   export type DisbursementCreateManyInput = {
@@ -45980,6 +46002,7 @@ export namespace Prisma {
     createdAt?: Date | string
     completedAt?: Date | string | null
     ledger: number
+    batchId?: string | null
   }
 
   export type DisbursementUpdateManyMutationInput = {
@@ -45994,6 +46017,7 @@ export namespace Prisma {
     createdAt?: DateTimeFieldUpdateOperationsInput | Date | string
     completedAt?: NullableDateTimeFieldUpdateOperationsInput | Date | string | null
     ledger?: IntFieldUpdateOperationsInput | number
+    batchId?: NullableStringFieldUpdateOperationsInput | string | null
   }
 
   export type DisbursementUncheckedUpdateManyInput = {
@@ -46008,6 +46032,7 @@ export namespace Prisma {
     createdAt?: DateTimeFieldUpdateOperationsInput | Date | string
     completedAt?: NullableDateTimeFieldUpdateOperationsInput | Date | string | null
     ledger?: IntFieldUpdateOperationsInput | number
+    batchId?: NullableStringFieldUpdateOperationsInput | string | null
   }
 
   export type AssetMappingCreateInput = {
@@ -48596,6 +48621,7 @@ export namespace Prisma {
     createdAt?: SortOrder
     completedAt?: SortOrder
     ledger?: SortOrder
+    batchId?: SortOrder
   }
 
   export type DisbursementAvgOrderByAggregateInput = {
@@ -48615,6 +48641,7 @@ export namespace Prisma {
     createdAt?: SortOrder
     completedAt?: SortOrder
     ledger?: SortOrder
+    batchId?: SortOrder
   }
 
   export type DisbursementMinOrderByAggregateInput = {
@@ -48629,6 +48656,7 @@ export namespace Prisma {
     createdAt?: SortOrder
     completedAt?: SortOrder
     ledger?: SortOrder
+    batchId?: SortOrder
   }
 
   export type DisbursementSumOrderByAggregateInput = {

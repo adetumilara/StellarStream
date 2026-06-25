@@ -452,7 +452,8 @@ exports.Prisma.DisbursementScalarFieldEnum = {
   status: 'status',
   createdAt: 'createdAt',
   completedAt: 'completedAt',
-  ledger: 'ledger'
+  ledger: 'ledger',
+  batchId: 'batchId'
 };
 
 exports.Prisma.AssetMappingScalarFieldEnum = {

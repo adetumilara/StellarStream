@@ -1,6 +1,7 @@
 import { Router, Request, Response } from "express";
 import { WebhookDispatcherService } from "../services/webhook-dispatcher.service.js";
 import { logger } from "../logger.js";
+import { requireAdmin } from "../middleware/requireAdmin.js";
 
 const router = Router();
 const webhookService = new WebhookDispatcherService();
@@ -64,6 +65,27 @@ router.post("/test", async (req: Request, res: Response) => {
   } catch (error) {
     logger.error("Error testing webhook", error);
     res.status(500).json({ error: "Failed to test webhook" });
+  }
+});
+
+/**
+ * POST /api/v1/webhooks/:webhookId/rotate-secret
+ * Rotate a webhook signing secret. Admin only.
+ */
+router.post("/:webhookId/rotate-secret", requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const { webhookId } = req.params;
+
+    const webhook = await webhookService.rotateWebhookSecret(webhookId);
+
+    res.json({
+      success: true,
+      webhook,
+      message: "Webhook secret rotated successfully. Store the new secretKey securely.",
+    });
+  } catch (error) {
+    logger.error("Error rotating webhook secret", error);
+    res.status(500).json({ error: "Failed to rotate webhook secret" });
   }
 });
 
